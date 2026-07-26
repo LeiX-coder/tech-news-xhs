@@ -2,14 +2,26 @@ name: Daily Tech News Monitor
 
 on:
   schedule:
-    # 每天北京时间早上 8 点跑一次（UTC 0 点）
-    - cron: '0 0 * * *'
-  workflow_dispatch:  # 允许手动点击运行
+    # cron 一律按 UTC 解释。美东夏令时 = UTC-4，冬令时 = UTC-5。
+    # 12:10 UTC ≈ 08:10 ET（盘前），21:40 UTC ≈ 17:40 ET（盘后，覆盖当天财报）。
+    # 避开整点：GitHub 的定时任务在 :00 排队最严重，可能延迟 5-30 分钟。
+    - cron: '10 12 * * 1-5'
+    - cron: '40 21 * * 1-5'
+  workflow_dispatch:
+
+# 上一次没跑完不开下一次，否则两个进程同时写 state 会互相覆盖
+concurrency:
+  group: daily-news
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # 需要把 state/ 写回仓库
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 45
+
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -18,6 +30,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: 安装依赖
         run: |
@@ -29,9 +42,26 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: python main.py
 
+      # 关键：runner 每次都是全新的机器，不把 state 提交回仓库的话，
+      # 下次运行 seen 是空的，回溯窗口内的内容会被全部重新处理一遍。
+      - name: 保存去重状态
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A state/ output/
+          if git diff --staged --quiet; then
+            echo "无变更，跳过提交"
+          else
+            git commit -m "chore: 更新监控状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git pull --rebase --autostash origin ${{ github.ref_name }}
+            git push
+          fi
+
       - name: 上传生成的文案
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xiaohongshu-output
+          name: xiaohongshu-output-${{ github.run_number }}
           path: output/
-          retention-days: 7
+          retention-days: 14
