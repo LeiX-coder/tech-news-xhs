@@ -13,8 +13,8 @@
 6. 全流程美东时间；用 acceptanceDateTime（精确到秒，能区分盘中/盘后）。
 7. 加去重（已处理的 accession 落盘）。
 8. 异常处理下沉到单份文件粒度。
-9. Prompt 改为 星火速报 的既有文案规范。
-10. 生成后做数字校验，输出里出现原文没有的数字会告警。
+9. Prompt 改为小红书排版风格，带 emoji 分隔符和话题标签。
+10. 生成后做数字校验，输出里出现原文没有的数字会告警（修复了空格/逗号误报）。
 11. 支持 6-K —— NOK / ASML / TSM 是外国发行人，根本不发 8-K。
 
 依赖: pip install requests beautifulsoup4 lxml openai
@@ -269,7 +269,6 @@ def list_filings(cik: int, forms=("8-K", "6-K"), lookback_days=3):
             "accepted_et": accepted,
             "items": items,
             "base": base,
-            # 正确的完整提交文本路径：目录 + 带横杠的 accession
             "full_txt_url": f"{base}/{acc_dash}.txt",
             "primary_url": f"{base}/{rec['primaryDocument'][i]}",
         })
@@ -289,7 +288,6 @@ def list_documents(base: str, accession: str):
         if len(cells) < 4 or not link:
             continue
         href = link.get("href", "").split("#")[0]
-        # iXBRL 链接被包了一层 viewer，要剥掉才是真实文件地址
         if href.startswith("/ix?doc="):
             href = href[len("/ix?doc="):]
         docs.append({
@@ -301,30 +299,19 @@ def list_documents(base: str, accession: str):
     return docs
 
 
-# 无分隔符文件名（ex991.htm）拆分时的候选主编号，长的优先匹配。
-# 刻意不含 101/104——那是 XBRL 附件，只会以 'EX-101.INS' 这种
-# 带分隔符的形式出现在 Type 列，不会写成裸文件名。
 _MAJOR_CANDIDATES = ["99", "32", "31", "24", "23", "21", "10",
                      "1", "2", "3", "4", "5", "7", "8"]
 
 
 def _exhibit_number(s: str):
-    """归一化附件编号。
-
-    'EX-99.1' / 'EX-99.01' / 'ex99-1.htm' / 'ex991.htm' 一律 -> (99, 1)
-    'EX-101.INS' -> (101, 0)，不会被误认成 EX-10.1
-    """
+    """归一化附件编号。"""
     s = s.lower()
 
-    # XBRL 附件（EX-101.INS / EX-101.SCH ...）单独识别，
-    # 否则会被拆成 (10, 1) 而误认成 EX-10.1
     if re.search(r"ex[\-_]?(\d{3})\.(ins|sch|cal|def|lab|pre)", s):
         return (int(re.search(r"ex[\-_]?(\d{3})", s).group(1)), 0)
 
-    # 先去掉文件扩展名，否则 'ex991.htm' 的那个点会被当成编号分隔符
     s = re.sub(r"\.(htm|html|txt|xml|xsd|pdf|jpe?g|png|gif)$", "", s)
 
-    # 分隔符只有在后面紧跟数字时才算分隔符
     m = re.search(r"ex[\-_]?(\d+)(?:[\.\-_](\d+))?", s)
     if not m:
         return None
@@ -333,10 +320,6 @@ def _exhibit_number(s: str):
     if minor is not None:
         return (int(digits), int(minor))
 
-    # 无分隔符：ex991 / ex9901 / dex101 这类，按候选主编号拆。
-    # 只在 3 位及以上时拆——'ex21' 到底是 EX-21 还是 EX-2.1 无法判断，
-    # 保持原样即可，因为 Type 列（'EX-2.1'）才是权威来源，
-    # 文件名只是兜底。
     if len(digits) >= 3:
         for major in _MAJOR_CANDIDATES:
             if digits.startswith(major) and len(digits) > len(major):
@@ -345,7 +328,7 @@ def _exhibit_number(s: str):
 
 
 def find_exhibit(docs, major: int, minor: int):
-    """按归一化后的编号找附件，容忍 EX-99.1 / EX-99.01 / ex991.htm 各种写法。"""
+    """按归一化后的编号找附件。"""
     for d in docs:
         for field in (d["type"], d["doc"]):
             num = _exhibit_number(field)
@@ -355,13 +338,7 @@ def find_exhibit(docs, major: int, minor: int):
 
 
 def extract_press_release(text: str, head_chars=4500, guidance_window=2500) -> str:
-    """财报新闻稿处理。
-
-    刻意不做关键词 grep 抽数字——那会把标签和数值拆散、打乱顺序，
-    模型只能猜哪个数字对应哪个指标。新闻稿开头本来就是结构化要点
-    （营收、分部、EPS），直接给原文最安全。
-    唯一的额外处理是：确保末尾的「指引」段落不被截断丢掉。
-    """
+    """财报新闻稿处理。"""
     if len(text) <= head_chars + guidance_window:
         return text
 
@@ -391,7 +368,6 @@ def build_content(filing: dict) -> dict:
     exhibits_used = []
     docs = None
 
-    # Item 2.02：正文只有一句「详见附件」，数字全在新闻稿里，必须跟进
     if "2.02" in items or filing["form"] == "6-K":
         docs = list_documents(filing["base"], filing["accession"])
         ex = find_exhibit(docs, 99, 1) or find_exhibit(docs, 99, 0)
@@ -402,13 +378,7 @@ def build_content(filing: dict) -> dict:
             )
             exhibits_used.append(ex["url"])
         elif "2.02" in items:
-            # 财报却拿不到新闻稿，宁可报错也不要生成一条没数字的文案
             raise RuntimeError("Item 2.02 但未找到 EX-99.x 新闻稿")
-
-    # 注意：这里刻意【不】抓 EX-10.x。
-    # 信贷协议/并购协议原件动辄几百 KB 到几 MB，开头 2000 字符全是
-    # 封面和目录，对写稿毫无用处。8-K 正文的法定作用就是概括这些
-    # 重大条款，正文已经够了。要抠具体条款时人工去看原件。
 
     return {
         "text": "\n\n".join(parts),
@@ -422,49 +392,66 @@ def should_process(filing: dict) -> tuple:
     items = filing["items"]
 
     if filing["form"] == "6-K":
-        # 6-K 没有 Item 代码，外国发行人用它发财报和重大公告，数量不多，全收
         return True, "6-K"
 
     if not items:
-        # 8-K 一定有 Item。空说明 API 数据异常，保留并告警
         return True, "⚠️ items 为空（数据异常，保留复核）"
 
     hit = set(items) & set(WANTED_ITEMS)
     if not hit:
         return False, f"仅含附属条目: {','.join(items)}"
 
-    # 5.02 单独出现时做关键词二次筛，滤掉董事会换届之类的常规事项
     if hit == {"5.02"}:
         return "CHECK_5_02", "5.02 待关键词确认"
 
     return True, ",".join(sorted(hit))
 
 
-# ==================== 文案生成 ====================
+# ==================== 文案生成（小红书排版版） ====================
 
 SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与科技公司的新闻快讯。
 
-严格遵守以下格式与文风规范：
+严格按以下格式输出，这是固定模板，必须遵守：
 
-1. 第一行只写日期，格式为「2026年7月2日」，单独成行。
-2. 全文只使用美东时间作为时间参照，绝对不出现北京时间。
-3. 第一句话中自然带出消息来源（如「据公司向美国证券交易委员会提交的文件」
-   或「据彭博社」），不要用「根据8-K文件」这种生硬表达。
-4. 语气克制、平实，不使用夸张词、不使用感叹号堆砌、不做情绪煽动。
-   不要写「炸了」「震惊」「速看」这类标题党用语。
-5. 只陈述材料中已确认的事实。任何没有出现在材料里的数字、时间、
-   人名、因果推断，一律不得写入。宁可少写，不可编造。
-6. 涉及财务数据时，必须与材料中的数字完全一致，包括单位和口径
-   （如「营收 36.2 亿美元」不可写成「36 亿」）。
-7. 结尾另起一行注明来源，格式为「来源：美国证券交易委员会公开文件」
-   或具体的新闻稿名称。
-8. 全文 300-500 字，不使用 emoji，不使用 markdown 标题符号。
-9. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」四个字，
-   不要勉强凑字数。"""
+第一行：📡 [核心消息标题]，20字以内，以 emoji 开头
+第二行：空行
+第三行：📅 [日期]，[公司全名]（[股票代码]）发布[公告类型]
+第四行：空行
+第五行：一句话总括，带 emoji 和 👇
+第六行：空行
+
+正文分四个段落，每段用 emoji 分隔符开头：
+
+─── 🚀 [段落一标题] ───
+💥 [核心要点]：[数据]
+📈 [次要要点]：[数据]
+· [子要点]
+
+─── 📊 [段落二标题] ───
+💵 [财务数据要点]
+📉 [变化说明]
+
+─── 💡 [段落三标题] ───
+[管理层解读或影响分析]
+
+─── 📝 总结 ───
+[一句话总结]
+
+最后两行：
+─ 📌 来源：[具体文件名称] ─
+
+[5-8个话题标签，以 # 开头，空格分隔]
+
+文风规范：
+1. 语气平实、克制，不夸张、不煽动
+2. 所有数字必须与原文完全一致
+3. 不使用 markdown 标题符号（#、##、###）
+4. 全文 300-500 字
+5. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」四个字，不要勉强凑字数。"""
 
 
-def generate_copy(content: str, company_name: str, accepted_et: datetime,
-                  items: list, form: str) -> str:
+def generate_copy(content: str, company_name: str, ticker: str,
+                  accepted_et: datetime, items: list, form: str) -> str:
     if not DEEPSEEK_API_KEY:
         return "【错误】未设置 DEEPSEEK_API_KEY 环境变量"
 
@@ -475,6 +462,7 @@ def generate_copy(content: str, company_name: str, accepted_et: datetime,
     ) if items else form
 
     user_prompt = f"""公司：{company_name}
+股票代码：{ticker}
 提交时间（美东）：{accepted_et.strftime('%Y-%m-%d %H:%M')} ET
 文件类型：{form}
 涉及事项：{item_desc}
@@ -482,7 +470,7 @@ def generate_copy(content: str, company_name: str, accepted_et: datetime,
 原始材料：
 {content}
 
-请按规范输出完整文案。"""
+请按上述格式输出完整文案。"""
 
     try:
         resp = client.chat.completions.create(
@@ -491,11 +479,9 @@ def generate_copy(content: str, company_name: str, accepted_et: datetime,
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.3,           # 事实类写作，压低随机性
+            temperature=0.3,
             max_tokens=1200,
             timeout=90,
-            # V4 默认开启思考模式，批量跑会明显拖慢并增加成本。
-            # 注意：思考模式下 temperature 不生效，所以这里必须关掉。
             extra_body={"thinking": {"type": "disabled"}},
         )
         return resp.choices[0].message.content.strip()
@@ -507,19 +493,20 @@ _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
 def check_numbers(copy_text: str, source_text: str) -> list:
-    """校验：文案里出现的数字，原文里是否存在。
+    """校验：文案里出现的数字，原文里是否存在（修复版：支持 4 815 -> 48.15）。"""
+    def normalize(s):
+        # 移除逗号、空格、货币符号、单位词
+        s = s.replace(",", "").replace(" ", "")
+        s = re.sub(r'[€$¥]', '', s)
+        # 移除"亿欧元"、"万欧元"等单位
+        s = re.sub(r'[亿万]欧元?', '', s)
+        return s
 
-    不是万无一失（模型可能做单位换算），但能捞出大部分凭空生成的数字。
-    """
-    def norm(s):
-        return s.replace(",", "")
-
-    src = norm(source_text)
+    src = normalize(source_text)
     suspicious = []
     for m in _NUM.finditer(copy_text):
         raw = m.group()
-        val = norm(raw)
-        # 忽略年份和一位数
+        val = normalize(raw)
         if len(val.replace(".", "")) <= 1:
             continue
         if re.fullmatch(r"(19|20)\d{2}", val):
@@ -556,9 +543,8 @@ def process_company(ticker: str, cik: int, seen: set):
             built = build_content(f)
         except Exception as e:
             print(f"  ❌ {acc} 内容提取失败: {e}")
-            continue    # 不加入 seen，下次重试
+            continue
 
-        # 5.02 的关键词二次确认
         if decision == "CHECK_5_02":
             low = built["text"].lower()
             if not any(k in low for k in EXEC_CHANGE_KEYWORDS):
@@ -572,8 +558,12 @@ def process_company(ticker: str, cik: int, seen: set):
             print(f"  🚨 高优先级事件: {','.join(set(f['items']) & ALERT_ITEMS)}")
 
         copy_text = generate_copy(
-            built["text"], COMPANIES.get(ticker, ticker),
-            f["accepted_et"], f["items"], f["form"],
+            built["text"],
+            COMPANIES.get(ticker, ticker),
+            ticker,
+            f["accepted_et"],
+            f["items"],
+            f["form"],
         )
 
         warnings = []
@@ -681,7 +671,7 @@ def main():
             print(f"  ❌ {ticker} 整体失败：{e}")
             failed.append(ticker)
         finally:
-            save_seen(seen)   # 每家跑完就落盘，中途崩溃也不会重复处理
+            save_seen(seen)
 
     print("-" * 60)
     if all_results:
