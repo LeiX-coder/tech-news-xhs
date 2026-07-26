@@ -5,6 +5,7 @@
 数据源：
 1. SEC 8-K / 6-K 申报文件
 2. TechCrunch 科技新闻（仅保留监控公司相关）
+3. 公司官网新闻发布（Press Release）
 """
 
 import os
@@ -16,6 +17,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,6 +29,7 @@ import feedparser
 # SEC 强制要求：必须是真实的「名字 邮箱」
 SEC_IDENTITY = "xiaolei xiaolei12555@126.com"
 
+# 公司基本名称（用于显示）
 COMPANIES = {
     "INTC": "英特尔 Intel",
     "NOK": "诺基亚 Nokia",
@@ -65,9 +68,112 @@ COMPANIES = {
     "STX": "希捷 Seagate",
 }
 
+# 公司官网新闻页 URL
+COMPANY_NEWS_URLS = {
+    "INTC": "https://www.intel.com/content/www/us/en/newsroom/news.html",
+    "NOK": "https://www.nokia.com/about-us/news/releases/",
+    "AAOI": "https://investors.ao-inc.com/news-releases",
+    "LITE": "https://investor.lumentum.com/news-releases",
+    "MU": "https://investors.micron.com/news-releases",
+    "AAPL": "https://www.apple.com/newsroom/",
+    "MSFT": "https://news.microsoft.com/",
+    "NVDA": "https://nvidianews.nvidia.com/",
+    "GOOGL": "https://blog.google/",
+    "AMZN": "https://www.aboutamazon.com/news",
+    "META": "https://about.fb.com/news/",
+    "AVGO": "https://investors.broadcom.com/news-releases",
+    "TSM": "https://pr.tsmc.com/english/news",
+    "AMD": "https://ir.amd.com/news-releases",
+    "QCOM": "https://www.qualcomm.com/news/releases",
+    "TXN": "https://investor.ti.com/news-releases",
+    "AMAT": "https://investors.appliedmaterials.com/news-releases",
+    "LRCX": "https://investor.lamresearch.com/news-releases",
+    "KLAC": "https://ir.kla.com/news-releases",
+    "ADI": "https://investors.analog.com/news-releases",
+    "NXPI": "https://investors.nxp.com/news-releases",
+    "MRVL": "https://investors.marvell.com/news-releases",
+    "ASML": "https://www.asml.com/en/news/press-releases",
+    "SMCI": "https://www.supermicro.com/en/about/newsroom",
+    "WDC": "https://investor.wdc.com/news-releases",
+    "SNPS": "https://www.synopsys.com/company/news.html",
+    "CDNS": "https://www.cadence.com/en_US/home/company/news-events.html",
+    "CSCO": "https://newsroom.cisco.com/",
+    "PANW": "https://www.paloaltonetworks.com/company/newsroom",
+    "CRWD": "https://www.crowdstrike.com/news/",
+    "ZS": "https://www.zscaler.com/company/newsroom",
+    "FTNT": "https://www.fortinet.com/corporate/about-us/newsroom",
+    "PLTR": "https://www.palantir.com/news/",
+    "ANET": "https://www.arista.com/en/news",
+    "STX": "https://investors.seagate.com/news-releases",
+}
+
+# 官网解析选择器（可针对不同公司定制）
+NEWS_SELECTORS = {
+    "default": {
+        "link_selector": "a[href*='news'], a[href*='release'], a[href*='press']",
+        "title_selector": None,
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$', r'\bnewsletter\b', r'\brss\b']
+    },
+    "INTC": {
+        "link_selector": "a[href*='/news/'], a[href*='/press/']",
+        "title_selector": "h3, h2, .title",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$', r'\bnewsletter\b']
+    },
+    "AMD": {
+        "link_selector": "a[href*='news-releases']",
+        "title_selector": ".title, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "NVDA": {
+        "link_selector": "a[href*='/news/']",
+        "title_selector": ".headline, h2",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "AAPL": {
+        "link_selector": "a[href*='/newsroom/']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "MSFT": {
+        "link_selector": "a[href*='/news/']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "GOOGL": {
+        "link_selector": "a[href*='/blog/']",
+        "title_selector": "h3, h2",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "AMZN": {
+        "link_selector": "a[href*='/news/']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "META": {
+        "link_selector": "a[href*='/news/']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "TSM": {
+        "link_selector": "a[href*='/english/news']",
+        "title_selector": ".title, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "ASML": {
+        "link_selector": "a[href*='/news/press-releases']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+    "SMCI": {
+        "link_selector": "a[href*='/newsroom/']",
+        "title_selector": "h2, h3",
+        "exclude_patterns": [r'\.(jpg|png|gif|pdf|xml|json)$']
+    },
+}
+
 DAYS_LOOKBACK = 3
 
-# 白名单：只处理这些 Item
+# 白名单 Item
 WANTED_ITEMS = {
     "1.01": "签署重大协议",
     "1.02": "终止重大协议",
@@ -84,13 +190,9 @@ WANTED_ITEMS = {
     "5.02": "董事或高管任免",
 }
 
-# 附属/程序性条目，单独出现时不构成新闻
 FILLER_ITEMS = {"7.01", "8.01", "9.01", "5.03", "5.07", "5.08"}
-
-# 最高优先级：出现即单独告警
 ALERT_ITEMS = {"4.02", "1.03", "3.01"}
 
-# 5.02 关键词二次筛选
 EXEC_CHANGE_KEYWORDS = [
     "resign", "resignation", "step down", "stepping down", "depart",
     "terminate", "termination", "effective immediately", "transition",
@@ -98,7 +200,6 @@ EXEC_CHANGE_KEYWORDS = [
     "interim", "successor", "retire", "retirement",
 ]
 
-# TechCrunch RSS
 TECHCRUNCH_RSS_URL = "https://techcrunch.com/feed/"
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -112,7 +213,7 @@ STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
 SEEN_FILE = STATE_DIR / "seen_accessions.json"
 
-# ==================== HTTP 层：限速 + 重试 ====================
+# ==================== HTTP 层 ====================
 
 _lock = threading.Lock()
 _last_request = [0.0]
@@ -122,7 +223,6 @@ HEADERS = {
     "User-Agent": SEC_IDENTITY,
     "Accept-Encoding": "gzip, deflate",
 }
-
 
 def sec_get(url: str, max_retries: int = 3, timeout: int = 45):
     for attempt in range(max_retries):
@@ -151,11 +251,9 @@ def sec_get(url: str, max_retries: int = 3, timeout: int = 45):
 
     raise RuntimeError(f"请求失败（已重试 {max_retries} 次）: {url}")
 
-
 # ==================== 基础工具 ====================
 
 _ticker_cache = {}
-
 
 def load_ticker_map() -> dict:
     if _ticker_cache:
@@ -165,19 +263,16 @@ def load_ticker_map() -> dict:
         _ticker_cache[row["ticker"].upper()] = int(row["cik_str"])
     return _ticker_cache
 
-
 def clean_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     for tag in soup.find_all(["ix:header", "ix:hidden", "script", "style"]):
         tag.decompose()
     for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.I)):
         tag.decompose()
-
     text = soup.get_text("\n").replace("\xa0", " ")
     lines = [ln.strip() for ln in text.splitlines()]
     text = "\n".join(ln for ln in lines if ln)
     return re.sub(r"\n{3,}", "\n\n", text)
-
 
 def parse_accepted_et(raw: str, fallback_date: str) -> datetime:
     if raw:
@@ -188,7 +283,6 @@ def parse_accepted_et(raw: str, fallback_date: str) -> datetime:
             pass
     return datetime.fromisoformat(fallback_date).replace(tzinfo=ET)
 
-
 def load_seen() -> set:
     if SEEN_FILE.exists():
         try:
@@ -197,13 +291,11 @@ def load_seen() -> set:
             return set()
     return set()
 
-
 def save_seen(seen: set):
     STATE_DIR.mkdir(exist_ok=True)
     SEEN_FILE.write_text(
         json.dumps(sorted(seen), ensure_ascii=False, indent=0), encoding="utf-8"
     )
-
 
 # ==================== SEC 抓取 ====================
 
@@ -245,12 +337,10 @@ def list_filings(cik: int, forms=("8-K", "6-K"), lookback_days=3):
             "base": base,
             "full_txt_url": f"{base}/{acc_dash}.txt",
             "primary_url": f"{base}/{rec['primaryDocument'][i]}",
-            # 6-K 没有 Item 代码，这个字段是判断它讲什么的唯一结构化线索
             "doc_desc": (rec.get("primaryDocDescription") or [""] * n)[i] or "",
         })
 
     return out
-
 
 def list_documents(base: str, accession: str):
     html = sec_get(f"{base}/{accession}-index.htm").text
@@ -273,10 +363,8 @@ def list_documents(base: str, accession: str):
         })
     return docs
 
-
 _MAJOR_CANDIDATES = ["99", "32", "31", "24", "23", "21", "10",
                      "1", "2", "3", "4", "5", "7", "8"]
-
 
 def _exhibit_number(s: str):
     s = s.lower()
@@ -300,7 +388,6 @@ def _exhibit_number(s: str):
                 return (int(major), int(digits[len(major):]))
     return (int(digits), 0)
 
-
 def find_exhibit(docs, major: int, minor: int):
     for d in docs:
         for field in (d["type"], d["doc"]):
@@ -308,7 +395,6 @@ def find_exhibit(docs, major: int, minor: int):
             if num and num[0] == major and (num[1] == minor or minor == 0):
                 return d
     return None
-
 
 def extract_press_release(text: str, head_chars=4500, guidance_window=2500) -> str:
     if len(text) <= head_chars + guidance_window:
@@ -325,7 +411,6 @@ def extract_press_release(text: str, head_chars=4500, guidance_window=2500) -> s
         seg = rest[m.start(): m.start() + guidance_window]
         return f"{head}\n\n...（中间部分省略）...\n\n【指引 / Outlook 段落】\n{seg}"
     return head
-
 
 def build_content(filing: dict) -> dict:
     items = filing["items"]
@@ -357,23 +442,19 @@ def build_content(filing: dict) -> dict:
         "documents": docs,
     }
 
-
 def should_process(filing: dict) -> tuple:
     items = filing["items"]
 
     if filing["form"] == "6-K":
-        # 6-K 没有 Item 代码。primaryDocDescription 是 submissions API 里
-        # 唯一说明这份文件讲什么的结构化字段——比在 URL 文件名里
-        # 找关键词靠谱得多（文件名通常只是 form6k.htm）。
         haystack = f"{filing.get('doc_desc', '')} {filing.get('primary_url', '')}".lower()
 
         ROUTINE_KEYWORDS = [
-            "month end", "monthend", "monthly",     # 月度持股/股本变动
+            "month end", "monthend", "monthly",
             "insider", "shareholding", "share holding",
             "beneficial", "exempt",
             "total voting rights", "share capital",
             "transaction in own shares", "buy-back", "buyback",
-            "director", "pdmr",                     # 董监高交易申报
+            "director", "pdmr",
         ]
 
         for kw in ROUTINE_KEYWORDS:
@@ -394,13 +475,8 @@ def should_process(filing: dict) -> tuple:
 
     return True, ",".join(sorted(hit))
 
+# ==================== TechCrunch RSS ====================
 
-# ==================== TechCrunch RSS 抓取 ====================
-
-# 公司别名表。
-# 不能从 COMPANIES 自动生成：那里的值是「英伟达 Nvidia」这种中英混排，
-# 拿去匹配英文原文永远不中。也不能拿 ticker 当关键词——MU / ZS / STX
-# 这类两字母代码做子串匹配会命中 community、museum、must 之类的普通单词。
 ALIASES = {
     "INTC":  ["intel"],
     "NOK":   ["nokia"],
@@ -439,39 +515,25 @@ ALIASES = {
     "STX":   ["seagate"],
 }
 
-# 预编译：整词匹配，避免 "amd" 命中 "amds"、"meta" 命中 "metadata"
 _ALIAS_PATTERNS = {
     ticker: [re.compile(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])", re.I)
              for a in names]
     for ticker, names in ALIASES.items()
 }
 
-
 def extract_matched_companies(text: str) -> list:
-    """返回文本中确实提到的监控公司 ticker 列表。"""
     matched = []
     for ticker, pats in _ALIAS_PATTERNS.items():
         if any(p.search(text) for p in pats):
             matched.append(ticker)
     return matched
 
-
 def _stable_id(prefix: str, key: str) -> str:
-    """稳定去重键。
-
-    注意不能用内置 hash()：Python 对字符串的 hash 每个进程都随机化，
-    同一条链接每次运行得到的值都不一样，去重会完全失效。
-    """
     return f"{prefix}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
 
-
-# 摘要短于这个长度就只当线索登记，不生成文案——
-# 光靠一个标题写不出 300 字的准确快讯，只会逼模型编。
 MIN_SUMMARY_CHARS = 180
 
-
 def fetch_techcrunch_news(limit: int = 30):
-    """从 TechCrunch RSS 抓取文章，只保留监控公司相关的。"""
     try:
         feed = feedparser.parse(TECHCRUNCH_RSS_URL)
     except Exception as e:
@@ -501,57 +563,80 @@ def fetch_techcrunch_news(limit: int = 30):
         })
     return out
 
+# ==================== 官网新闻抓取 ====================
+
+def fetch_company_news(ticker: str, url: str, limit: int = 5) -> list:
+    try:
+        html = sec_get(url, timeout=30).text
+        soup = BeautifulSoup(html, "lxml")
+    except Exception as e:
+        print(f"    ⚠️ 请求 {ticker} 官网失败: {e}")
+        return []
+
+    cfg = NEWS_SELECTORS.get(ticker, NEWS_SELECTORS["default"])
+    link_selector = cfg.get("link_selector", "a[href*='news'], a[href*='release']")
+    title_selector = cfg.get("title_selector")
+    exclude_patterns = cfg.get("exclude_patterns", [])
+
+    candidates = []
+    for a in soup.select(link_selector):
+        href = a.get("href")
+        if not href:
+            continue
+        if href.startswith("#") or href.startswith("javascript:"):
+            continue
+        if any(re.search(pat, href, re.I) for pat in exclude_patterns):
+            continue
+
+        if title_selector:
+            title_elem = a.find_next(title_selector) or a
+            title = title_elem.get_text(strip=True)
+        else:
+            title = a.get_text(strip=True)
+
+        if len(title) < 10:
+            continue
+
+        if href.startswith("/"):
+            base_url = re.match(r'(https?://[^/]+)', url)
+            if base_url:
+                href = base_url.group(1) + href
+        elif not href.startswith("http"):
+            href = urljoin(url, href)
+
+        candidates.append({
+            "title": title,
+            "link": href,
+        })
+
+    seen_titles = set()
+    unique = []
+    for item in candidates:
+        if item["title"] not in seen_titles:
+            seen_titles.add(item["title"])
+            unique.append(item)
+
+    return unique[:limit]
 
 # ==================== 文案生成 ====================
 
+# -------- SEC / 官网 通用自由格式 --------
 SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与科技公司的新闻快讯。
 
-严格按以下格式输出，这是固定模板，必须遵守：
+要求：
+1. 小红书风格：口语化、有网感，适当使用 emoji 做视觉分隔，但不夸张、不标题党。
+2. 内容必须基于材料事实，不编造任何数字、时间、人名、因果推断。
+3. 结构灵活，根据内容类型自由调整：可以是数据罗列、对话体、分段叙述等，不要用固定模板。
+4. 正文第一句必须交代美东时间（ET），格式如「美东时间7月23日」。
+5. 结尾单独一行注明来源，格式为「来源：[具体文件名称/机构名称]」。
+6. 全文末尾带 5-8 个话题标签（以 # 开头）。
+7. 全文 300-500 字。
+8. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」四个字，不要勉强凑字数。
+9. 不要使用 markdown 标题符号（#、##、###）。
+10. 语气平实、克制，像朋友聊天，避免生硬书面语。
+11. 数字必须与原文完全一致。"""
 
-第一行：📡 [核心消息标题]，20字以内，以 emoji 开头
-第二行：空行
-第三行：📅 [日期]，[公司全名]（[股票代码]）发布[公告类型]
-        日期与时间一律使用美东时间（ET），全文不得出现北京时间或其他时区。
-第四行：空行
-第五行：一句话总括，带 emoji 和 👇
-第六行：空行
-
-正文分四个段落，每段用 emoji 分隔符开头：
-
-─── 🚀 [段落一标题] ───
-💥 [核心要点]：[数据]
-📈 [次要要点]：[数据]
-· [子要点]
-
-─── 📊 [段落二标题] ───
-💵 [财务数据要点]
-📉 [变化说明]
-（若材料中没有财务数据，整段省略，不要编造数字来填满模板）
-
-─── 💡 [段落三标题] ───
-[管理层解读或影响分析]
-注意：必须用转述方式，不要直接引用原话。
-
-─── 📝 总结 ───
-[一句话总结]
-
-最后两行：
-─ 📌 来源：[具体文件名称] ─
-
-[5-8个话题标签，以 # 开头，空格分隔]
-
-文风规范：
-1. 语气平实、克制，像朋友聊天，不夸张、不煽动
-2. 用口语化表达，避免生硬书面语
-3. 所有数字必须与原文完全一致，材料里没有的数字一律不得出现
-4. 段落是可选的：材料支撑不了某一段就整段删掉，模板服从事实，不是反过来
-5. 不使用 markdown 标题符号
-6. 全文 300-500 字
-7. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」"""
-
-
-# TechCrunch 只有标题 + 一小段摘要，撑不起上面那套四段模板。
-# 单独一套短格式，并且明确要求「不要补充材料之外的任何信息」。
+# -------- TechCrunch 短格式 --------
 TECHCRUNCH_PROMPT = """你是 星火速报 的撰稿人，为小红书写科技新闻短讯。
 
 材料来自 TechCrunch 的 RSS 摘要，信息量有限。严格遵守：
@@ -570,10 +655,10 @@ TECHCRUNCH_PROMPT = """你是 星火速报 的撰稿人，为小红书写科技�
    [3-5 个话题标签]
 6. 如果材料只够写一个标题、无法支撑一条独立短讯，直接输出「材料不足」。"""
 
-
 def generate_copy(content: str, company_name: str, ticker: str,
                   accepted_et: datetime, items: list, form: str,
-                  custom_title: str = None, is_routine: bool = False) -> str:
+                  source_url: str = "", custom_title: str = None,
+                  is_routine: bool = False) -> str:
     if not DEEPSEEK_API_KEY:
         return "【错误】未设置 DEEPSEEK_API_KEY 环境变量"
 
@@ -584,8 +669,6 @@ def generate_copy(content: str, company_name: str, ticker: str,
     ) if items else form
 
     title_hint = f"标题方向：{custom_title}" if custom_title else ""
-    
-    # 如果是月度常规披露，在提示中说明
     routine_hint = ""
     if is_routine:
         routine_hint = "这是公司每月例行披露的高管持股变动或内部人交易，属于常规治理信息，不是突发事件。请按「月度常规披露」的定位撰写，语气平和，不要过度解读。"
@@ -595,20 +678,22 @@ def generate_copy(content: str, company_name: str, ticker: str,
 提交时间（美东）：{accepted_et.strftime('%Y-%m-%d %H:%M')} ET
 文件类型：{form}
 涉及事项：{item_desc}
+数据来源：{source_url if source_url else form}
 {routine_hint}
 {title_hint}
 
 原始材料：
 {content}
 
-请按上述格式输出完整文案。"""
+请按上述要求输出完整文案。"""
+
+    system_prompt = TECHCRUNCH_PROMPT if form == "TechCrunch" else SYSTEM_PROMPT
 
     try:
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
-                {"role": "system",
-                 "content": TECHCRUNCH_PROMPT if form == "TechCrunch" else SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
@@ -620,24 +705,15 @@ def generate_copy(content: str, company_name: str, ticker: str,
     except Exception as e:
         return f"【生成失败】{e}"
 
-
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
-
-# 日期和时间会被拆成一串数字（2026-07-26 -> 2026 / 07 / 26），
-# 而这些数字来自元数据、不在原文里，不排除掉的话每条文案都会误报。
 _DATE_LIKE = re.compile(
-    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?"   # 2026-07-26 / 2026年7月26日
-    r"|\d{1,2}\s*[-/月]\s*\d{1,2}\s*日"                       # 7月26日
-    r"|\d{1,2}:\d{2}"                                          # 16:05
+    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?"
+    r"|\d{1,2}\s*[-/月]\s*\d{1,2}\s*日"
+    r"|\d{1,2}:\d{2}"
     r"|Q[1-4]|[一二三四]季度|第[1-4一二三四]季度"
 )
 
-
 def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> list:
-    """校验文案里的数字是否都能在原始材料中找到。
-
-    extra_allowed 用来放元数据里合法带入的内容（提交时间、股票代码等）。
-    """
     def normalize(s):
         s = s.replace(",", "").replace(" ", "")
         s = re.sub(r"[€$¥]", "", s)
@@ -653,16 +729,15 @@ def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> 
         val = normalize(raw)
         if len(val.replace(".", "")) <= 1:
             continue
-        if re.fullmatch(r"(19|20)\d{2}", val):      # 年份
+        if re.fullmatch(r"(19|20)\d{2}", val):
             continue
         if val not in src:
             suspicious.append(raw)
     return sorted(set(suspicious))
 
-
 # ==================== SEC 处理流程 ====================
 
-def process_company(ticker: str, cik: int, seen: set):
+def process_company_sec(ticker: str, cik: int, seen: set):
     results = []
     filings = list_filings(cik, lookback_days=DAYS_LOOKBACK)
 
@@ -676,8 +751,6 @@ def process_company(ticker: str, cik: int, seen: set):
             continue
 
         decision, reason = should_process(f)
-        
-        # 判断是否为月度常规 6-K
         is_routine_6k = (decision == "6-K_ROUTINE")
 
         if decision is False:
@@ -703,14 +776,14 @@ def process_company(ticker: str, cik: int, seen: set):
         if is_alert:
             print(f"  🚨 高优先级事件: {','.join(set(f['items']) & ALERT_ITEMS)}")
 
-        # 生成文案，传入 is_routine 参数
         copy_text = generate_copy(
-            built["text"],
-            COMPANIES.get(ticker, ticker),
-            ticker,
-            f["accepted_et"],
-            f["items"],
-            f["form"],
+            content=built["text"],
+            company_name=COMPANIES.get(ticker, ticker),
+            ticker=ticker,
+            accepted_et=f["accepted_et"],
+            items=f["items"],
+            form=f["form"],
+            source_url=f["primary_url"],
             is_routine=is_routine_6k
         )
 
@@ -727,7 +800,6 @@ def process_company(ticker: str, cik: int, seen: set):
                 warnings.append(f"数字未在原文中找到: {', '.join(bad)}")
                 print(f"  ⚠️  数字校验告警: {', '.join(bad)}")
 
-        # 如果是 routine 6-K，添加标记
         if is_routine_6k:
             warnings.append("月度常规披露，非突发事件")
 
@@ -751,15 +823,9 @@ def process_company(ticker: str, cik: int, seen: set):
 
     return results
 
-
 # ==================== TechCrunch 处理流程 ====================
 
 def process_techcrunch(articles: list, seen: set) -> list:
-    """处理 TechCrunch 文章。
-
-    和 SEC 那条路径共用同一个 seen 集合与同一套数字校验——
-    之前这两样在 TechCrunch 上都是绕过的。
-    """
     results = []
 
     for article in articles:
@@ -768,7 +834,6 @@ def process_techcrunch(articles: list, seen: set) -> list:
             print(f"    ⏭️  已处理过: {article['title'][:50]}")
             continue
 
-        # 摘要太短就只登记线索，不烧 API，也不给模型编造的机会
         if article["thin"]:
             print(f"    📎 线索（摘要过短，不生成文案）: {article['title'][:50]}")
             results.append({
@@ -790,9 +855,7 @@ def process_techcrunch(articles: list, seen: set) -> list:
             seen.add(aid)
             continue
 
-        content = (f"标题：{article['title']}\n\n"
-                   f"摘要：{article['summary']}\n\n"
-                   f"原文链接：{article['link']}")
+        content = f"标题：{article['title']}\n\n摘要：{article['summary']}\n\n原文链接：{article['link']}"
 
         copy_text = generate_copy(
             content=content,
@@ -801,6 +864,7 @@ def process_techcrunch(articles: list, seen: set) -> list:
             accepted_et=datetime.now(ET),
             items=["TechCrunch 报道"],
             form="TechCrunch",
+            source_url=article["link"],
             custom_title=article["title"].replace("|", " ").replace("\n", " ")[:100],
             is_routine=False,
         )
@@ -839,6 +903,62 @@ def process_techcrunch(articles: list, seen: set) -> list:
 
     return results
 
+# ==================== 官网新闻处理流程 ====================
+
+def process_company_website(ticker: str, url: str, seen: set) -> list:
+    results = []
+    articles = fetch_company_news(ticker, url, limit=5)
+    if not articles:
+        return results
+
+    print(f"    官网抓取到 {len(articles)} 篇新闻")
+    for article in articles:
+        aid = _stable_id("WEB", article["link"])
+        if aid in seen:
+            print(f"    ⏭️  已处理: {article['title'][:40]}")
+            continue
+
+        content = f"标题：{article['title']}\n\n原文链接：{article['link']}"
+        copy_text = generate_copy(
+            content=content,
+            company_name=COMPANIES.get(ticker, ticker),
+            ticker=ticker,
+            accepted_et=datetime.now(ET),
+            items=["官网新闻"],
+            form="官网",
+            source_url=article["link"],
+            custom_title=article["title"][:100],
+            is_routine=False,
+        )
+
+        warnings = []
+        if copy_text.startswith("【生成失败】") or copy_text.startswith("【错误】"):
+            warnings.append("生成失败")
+        elif copy_text.strip() == "材料不足":
+            warnings.append("模型判定材料不足（仅标题，需补充正文）")
+        else:
+            # 官网新闻只有标题和链接，无法做完整数字校验，暂时跳过
+            pass
+
+        results.append({
+            "ticker": ticker,
+            "company": COMPANIES.get(ticker, ticker),
+            "form": "官网",
+            "accepted_et": datetime.now(ET),
+            "accession": aid,
+            "items": ["官网新闻"],
+            "url": article["link"],
+            "exhibits": [],
+            "copy": copy_text,
+            "warnings": warnings,
+            "alert": False,
+            "source": "官网",
+            "is_routine": False,
+        })
+        seen.add(aid)
+        print(f"    ✅ 官网新闻: {article['title'][:40]}")
+
+    return results
 
 # ==================== 输出 ====================
 
@@ -855,6 +975,8 @@ def write_outputs(all_results: list, checked: int):
             path.parent.mkdir(parents=True, exist_ok=True)
         elif r["source"] == "TechCrunch":
             path = OUTPUT_DIR / f"TC_{ts}_{safe_ticker}_{suffix}.md"
+        elif r["source"] == "官网":
+            path = OUTPUT_DIR / f"WEB_{ts}_{safe_ticker}_{suffix}.md"
         else:
             path = OUTPUT_DIR / f"{ts}_{safe_ticker}_{suffix}.md"
 
@@ -884,6 +1006,7 @@ def write_outputs(all_results: list, checked: int):
         fh.write(f"监控公司：{checked} 家　可用文案：{len(drafts)} 条\n\n")
         fh.write(f"- SEC 申报：{len([r for r in drafts if r['source'] == 'SEC'])} 条\n")
         fh.write(f"- TechCrunch：{len([r for r in drafts if r['source'] == 'TechCrunch'])} 条\n")
+        fh.write(f"- 公司官网：{len([r for r in drafts if r['source'] == '官网'])} 条\n")
         if leads:
             fh.write(f"- TechCrunch 线索（未生成文案）：{len(leads)} 条\n")
         routine_count = len([r for r in all_results if r.get('is_routine', False)])
@@ -915,7 +1038,6 @@ def write_outputs(all_results: list, checked: int):
 
     return summary
 
-
 # ==================== 主流程 ====================
 
 def main():
@@ -925,34 +1047,32 @@ def main():
     print("-" * 60)
 
     all_results = []
-    failed = []
+    failed_sec = []
 
-    # ===== SEC 监控 =====
+    # ---- 1. SEC 监控 ----
     try:
         tmap = load_ticker_map()
     except Exception as e:
         print(f"❌ 无法加载 ticker→CIK 映射表：{e}")
-        return
+        tmap = {}
 
     seen = load_seen()
 
     for idx, ticker in enumerate(COMPANIES, 1):
         cik = tmap.get(ticker.upper())
         if not cik:
-            print(f"[{idx}/{len(COMPANIES)}] ❓ {ticker} 未找到 CIK，跳过")
-            failed.append(ticker)
+            print(f"[{idx}/{len(COMPANIES)}] ❓ {ticker} 未找到 CIK，跳过 SEC")
             continue
-
-        print(f"[{idx}/{len(COMPANIES)}] 📡 {ticker} ({COMPANIES[ticker]})")
+        print(f"[{idx}/{len(COMPANIES)}] 📡 SEC {ticker} ({COMPANIES[ticker]})")
         try:
-            all_results.extend(process_company(ticker, cik, seen))
+            all_results.extend(process_company_sec(ticker, cik, seen))
         except Exception as e:
-            print(f"  ❌ {ticker} 整体失败：{e}")
-            failed.append(ticker)
+            print(f"  ❌ {ticker} SEC 整体失败：{e}")
+            failed_sec.append(ticker)
         finally:
             save_seen(seen)
 
-    # ===== TechCrunch 监控 =====
+    # ---- 2. TechCrunch 监控 ----
     print("\n📡 正在抓取 TechCrunch 科技新闻...")
     try:
         tc_articles = fetch_techcrunch_news(limit=30)
@@ -968,13 +1088,31 @@ def main():
     except Exception as e:
         print(f"  ❌ TechCrunch 抓取失败：{e}")
 
-    # ===== 输出 =====
+    # ---- 3. 公司官网监控 ----
+    print("\n📡 正在抓取公司官网新闻...")
+    web_count = 0
+    for ticker, url in COMPANY_NEWS_URLS.items():
+        if ticker not in COMPANIES:
+            continue
+        print(f"  📄 {ticker} ({COMPANIES[ticker]})")
+        try:
+            results = process_company_website(ticker, url, seen)
+            if results:
+                web_count += len(results)
+                all_results.extend(results)
+            else:
+                print("    ℹ️ 无新闻或抓取失败")
+        except Exception as e:
+            print(f"    ❌ 抓取失败: {e}")
+    print(f"  官网共抓取 {web_count} 篇新闻")
+
+    # ---- 4. 输出 ----
     print("-" * 60)
     if all_results:
         path = write_outputs(all_results, len(COMPANIES))
         sec_count = len([r for r in all_results if r['source'] == 'SEC'])
-        tc_count = len([r for r in all_results
-                        if r['source'] == 'TechCrunch' and not r.get('lead_only')])
+        tc_count = len([r for r in all_results if r['source'] == 'TechCrunch' and not r.get('lead_only')])
+        web_count = len([r for r in all_results if r['source'] == '官网'])
         lead_count = len([r for r in all_results if r.get('lead_only')])
         routine_count = len([r for r in all_results if r.get('is_routine', False)])
         warned = [r for r in all_results if r["warnings"]]
@@ -982,6 +1120,7 @@ def main():
         print(f"✅ 完成：产出 {len(all_results) - lead_count} 条文案")
         print(f"   - SEC：{sec_count} 条")
         print(f"   - TechCrunch：{tc_count} 条")
+        print(f"   - 公司官网：{web_count} 条")
         if lead_count:
             print(f"   - TechCrunch 线索（未生成文案）：{lead_count} 条")
         if routine_count:
@@ -990,14 +1129,11 @@ def main():
             print(f"⚠️  {len(warned)} 条带告警，发布前人工复核：")
             for r in warned:
                 print(f"     {r['ticker']}: {'；'.join(r['warnings'])}")
-        if failed:
-            print(f"❌ {len(failed)} 家公司抓取失败：{', '.join(failed)}")
+        if failed_sec:
+            print(f"❌ SEC 失败：{', '.join(failed_sec)}")
         print(f"📁 汇总：{path.absolute()}")
     else:
         print("📭 本次没有新的可用内容")
-        if failed:
-            print(f"❌ 抓取失败：{', '.join(failed)}")
-
 
 if __name__ == "__main__":
     main()
