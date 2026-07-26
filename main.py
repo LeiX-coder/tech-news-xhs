@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-海外科技新闻监控 + 小红书文案生成（修订版）
-
-相对上一版的主要改动：
-1. 彻底不用 edgartools 做核心路由。Item 代码直接取自 SEC submissions API
-   的 items 字段（格式由 SEC 保证），消除 getattr 静默降级。
-2. Item 过滤改为白名单；5.02 加关键词二次筛；4.02 单独告警。
-3. 修正 .txt 兜底 URL；附件定位改为解析申报索引页的 Type 列。
-4. 统一用 SEC 要求的 User-Agent；全局限速 + 429/403 退避重试。
-5. 删掉关键词 grep 提数字的做法，改为原文头部 + 指引段落。
-6. 全流程美东时间；用 acceptanceDateTime（精确到秒，能区分盘中/盘后）。
-7. 加去重（已处理的 accession 落盘）。
-8. 异常处理下沉到单份文件粒度。
-9. Prompt 改为小红书排版风格，带 emoji 分隔符和话题标签。
-10. 生成后做数字校验，输出里出现原文没有的数字会告警（修复了空格/逗号误报）。
-11. 支持 6-K —— NOK / ASML / TSM 是外国发行人，根本不发 8-K。
-
-依赖: pip install requests beautifulsoup4 lxml openai
+海外科技新闻监控 + 小红书文案生成
+数据源：
+1. SEC 8-K / 6-K 申报文件
+2. TechCrunch 科技新闻（仅保留监控公司相关）
 """
 
 import os
@@ -32,10 +19,11 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
+import feedparser
 
 # ==================== 配置区域 ====================
 
-# SEC 强制要求：必须是真实的「名字 邮箱」，伪装成浏览器 UA 会被限流/403
+# SEC 强制要求：必须是真实的「名字 邮箱」
 SEC_IDENTITY = "xiaolei xiaolei12555@126.com"
 
 COMPANIES = {
@@ -78,8 +66,7 @@ COMPANIES = {
 
 DAYS_LOOKBACK = 3
 
-# 只处理这些 Item。白名单比黑名单可控：黑名单会被 9.01 / 7.01 这类
-# 「几乎每份都带」的附属条目击穿，等于没过滤。
+# 白名单：只处理这些 Item
 WANTED_ITEMS = {
     "1.01": "签署重大协议",
     "1.02": "终止重大协议",
@@ -102,13 +89,16 @@ FILLER_ITEMS = {"7.01", "8.01", "9.01", "5.03", "5.07", "5.08"}
 # 最高优先级：出现即单独告警
 ALERT_ITEMS = {"4.02", "1.03", "3.01"}
 
-# 5.02 里绝大多数是董事会换届等常规事项，靠关键词捞出真正的高管变动
+# 5.02 关键词二次筛选
 EXEC_CHANGE_KEYWORDS = [
     "resign", "resignation", "step down", "stepping down", "depart",
     "terminate", "termination", "effective immediately", "transition",
     "chief executive", "chief financial", "chief operating",
     "interim", "successor", "retire", "retirement",
 ]
+
+# TechCrunch RSS
+TECHCRUNCH_RSS_URL = "https://techcrunch.com/feed/"
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -125,7 +115,7 @@ SEEN_FILE = STATE_DIR / "seen_accessions.json"
 
 _lock = threading.Lock()
 _last_request = [0.0]
-MIN_INTERVAL = 0.12  # SEC 上限 10 req/s，留余量
+MIN_INTERVAL = 0.12
 
 HEADERS = {
     "User-Agent": SEC_IDENTITY,
@@ -134,7 +124,6 @@ HEADERS = {
 
 
 def sec_get(url: str, max_retries: int = 3, timeout: int = 45):
-    """所有对 SEC 的请求都走这里：统一 UA、全局限速、429/403 退避。"""
     for attempt in range(max_retries):
         with _lock:
             gap = time.monotonic() - _last_request[0]
@@ -168,7 +157,6 @@ _ticker_cache = {}
 
 
 def load_ticker_map() -> dict:
-    """ticker -> CIK。SEC 官方映射表。"""
     if _ticker_cache:
         return _ticker_cache
     data = sec_get(f"{SEC}/files/company_tickers.json").json()
@@ -178,11 +166,6 @@ def load_ticker_map() -> dict:
 
 
 def clean_html(html: str) -> str:
-    """从 inline XBRL / 普通 HTML 里抽干净正文。
-
-    必须先剔除 ix:header、ix:hidden 和 display:none 的节点，
-    否则 get_text() 会混进大量 XBRL 上下文噪声。
-    """
     soup = BeautifulSoup(html, "lxml")
     for tag in soup.find_all(["ix:header", "ix:hidden", "script", "style"]):
         tag.decompose()
@@ -196,11 +179,6 @@ def clean_html(html: str) -> str:
 
 
 def parse_accepted_et(raw: str, fallback_date: str) -> datetime:
-    """acceptanceDateTime 形如 '2026-07-02T16:05:43.000Z'。
-
-    注意：这个 Z 后缀是误导性的，SEC 存的实际是美东时间，
-    不要再当 UTC 做时区转换，否则会差 4~5 小时。
-    """
     if raw:
         try:
             naive = datetime.fromisoformat(raw.replace("Z", "").split(".")[0])
@@ -226,14 +204,9 @@ def save_seen(seen: set):
     )
 
 
-# ==================== EDGAR 抓取 ====================
+# ==================== SEC 抓取 ====================
 
 def list_filings(cik: int, forms=("8-K", "6-K"), lookback_days=3):
-    """从 submissions API 拉申报列表。
-
-    items 字段由 SEC 直接给出（形如 '2.02,9.01'），不需要解析任何 HTML，
-    也就不存在库版本差异导致的静默失败。
-    """
     url = f"https://data.sec.gov/submissions/CIK{cik:010d}.json"
     data = sec_get(url).json()
     rec = data["filings"]["recent"]
@@ -277,7 +250,6 @@ def list_filings(cik: int, forms=("8-K", "6-K"), lookback_days=3):
 
 
 def list_documents(base: str, accession: str):
-    """解析申报索引页，拿到每个文件的 Description / Type / URL。"""
     html = sec_get(f"{base}/{accession}-index.htm").text
     soup = BeautifulSoup(html, "lxml")
 
@@ -304,7 +276,6 @@ _MAJOR_CANDIDATES = ["99", "32", "31", "24", "23", "21", "10",
 
 
 def _exhibit_number(s: str):
-    """归一化附件编号。"""
     s = s.lower()
 
     if re.search(r"ex[\-_]?(\d{3})\.(ins|sch|cal|def|lab|pre)", s):
@@ -328,7 +299,6 @@ def _exhibit_number(s: str):
 
 
 def find_exhibit(docs, major: int, minor: int):
-    """按归一化后的编号找附件。"""
     for d in docs:
         for field in (d["type"], d["doc"]):
             num = _exhibit_number(field)
@@ -338,7 +308,6 @@ def find_exhibit(docs, major: int, minor: int):
 
 
 def extract_press_release(text: str, head_chars=4500, guidance_window=2500) -> str:
-    """财报新闻稿处理。"""
     if len(text) <= head_chars + guidance_window:
         return text
 
@@ -356,7 +325,6 @@ def extract_press_release(text: str, head_chars=4500, guidance_window=2500) -> s
 
 
 def build_content(filing: dict) -> dict:
-    """正文 + 按需附件。返回 dict，失败抛异常（不静默降级）。"""
     items = filing["items"]
     parts = []
 
@@ -388,25 +356,30 @@ def build_content(filing: dict) -> dict:
 
 
 def should_process(filing: dict) -> tuple:
-    """返回 (是否处理, 原因)。"""
     items = filing["items"]
 
     if filing["form"] == "6-K":
-        # 6-K 没有 Item 代码，但可能是持股变动等琐碎事项
-        # 通过 primary_url 里的关键词判断
+        # 6-K 全部保留，但标记类型供后续处理参考
         url = filing.get("primary_url", "")
-        # 持股变动、月度披露、内部交易等琐碎事项
-        SKIP_KEYWORDS = [
-            "monthend",      # 月度披露（台积电这类）
+        is_routine = False
+        routine_reason = ""
+
+        ROUTINE_KEYWORDS = [
+            "monthend",      # 月度持股变动
             "insider",       # 内部人交易
             "shareholding",  # 持股变动
             "exempt",        # 豁免申报
             "beneficial",    # 受益所有权变动
         ]
-        for kw in SKIP_KEYWORDS:
+
+        for kw in ROUTINE_KEYWORDS:
             if kw in url.lower():
-                return False, f"6-K 琐碎事项（{kw}）"
-        # 不是琐碎事项的 6-K 保留
+                is_routine = True
+                routine_reason = kw
+                break
+
+        if is_routine:
+            return "6-K_ROUTINE", f"6-K 琐碎事项（{routine_reason}，但保留）"
         return True, "6-K"
 
     if not items:
@@ -422,7 +395,64 @@ def should_process(filing: dict) -> tuple:
     return True, ",".join(sorted(hit))
 
 
-# ==================== 文案生成（小红书排版版） ====================
+# ==================== TechCrunch RSS 抓取 ====================
+
+# 从 COMPANIES 自动生成搜索关键词
+_COMPANY_SEARCH_TERMS = set()
+for ticker, name in COMPANIES.items():
+    _COMPANY_SEARCH_TERMS.add(ticker.upper())
+    _COMPANY_SEARCH_TERMS.add(ticker.lower())
+    # 提取核心名称（去掉 " Inc."、" Corporation" 等）
+    core = re.sub(r'\s+(Inc\.?|Corp\.?|Corporation|LLC|Ltd\.?|Limited|公司)$', '', name, flags=re.I)
+    _COMPANY_SEARCH_TERMS.add(core)
+    # 如果名称包含括号，也提取括号外的部分
+    if '(' in name:
+        main_name = name.split('(')[0].strip()
+        _COMPANY_SEARCH_TERMS.add(main_name)
+    _COMPANY_SEARCH_TERMS.add(name)
+
+
+def is_company_mentioned(text: str) -> bool:
+    """检查文本中是否提到监控名单中的公司"""
+    text_lower = text.lower()
+    for term in _COMPANY_SEARCH_TERMS:
+        if term and term.lower() in text_lower:
+            return True
+    return False
+
+
+def fetch_techcrunch_news(limit: int = 30):
+    """从 TechCrunch RSS 抓取文章，只保留监控公司相关的"""
+    try:
+        feed = feedparser.parse(TECHCRUNCH_RSS_URL)
+        
+        filtered = []
+        for entry in feed.entries[:limit]:
+            full_text = entry.title + " " + entry.summary
+            if is_company_mentioned(full_text):
+                # 找出具体提到了哪家公司
+                matched = []
+                for ticker, name in COMPANIES.items():
+                    if ticker.upper() in full_text.upper() or name in full_text:
+                        if ticker not in matched:
+                            matched.append(ticker)
+                
+                filtered.append({
+                    "title": entry.title,
+                    "link": entry.link,
+                    "summary": entry.summary,
+                    "published": entry.get("published", ""),
+                    "source": "TechCrunch",
+                    "matched_companies": matched
+                })
+        
+        return filtered
+    except Exception as e:
+        print(f"  ⚠️ TechCrunch RSS 抓取失败: {e}")
+        return []
+
+
+# ==================== 文案生成 ====================
 
 SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与科技公司的新闻快讯。
 
@@ -448,10 +478,7 @@ SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与�
 
 ─── 💡 [段落三标题] ───
 [管理层解读或影响分析]
-注意：这里必须用转述方式，不要直接引用原话。
-例如：
-❌ 不要写："CEO表示：'我们正加大投资以支撑未来增长'"
-✅ 要写："管理层认为，AI正在驱动前所未有的计算需求，公司正加大设备投资以支撑未来增长。"
+注意：必须用转述方式，不要直接引用原话。
 
 ─── 📝 总结 ───
 [一句话总结]
@@ -463,29 +490,39 @@ SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与�
 
 文风规范：
 1. 语气平实、克制，像朋友聊天，不夸张、不煽动
-2. 用口语化表达，避免生硬书面语。比如用"涨了"不用"同比增长"（但数字要保留）
+2. 用口语化表达，避免生硬书面语
 3. 所有数字必须与原文完全一致
-4. 不使用 markdown 标题符号（#、##、###）
+4. 不使用 markdown 标题符号
 5. 全文 300-500 字
-6. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」四个字，不要勉强凑字数。"""
+6. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」"""
 
 
 def generate_copy(content: str, company_name: str, ticker: str,
-                  accepted_et: datetime, items: list, form: str) -> str:
+                  accepted_et: datetime, items: list, form: str,
+                  custom_title: str = None, is_routine: bool = False) -> str:
     if not DEEPSEEK_API_KEY:
         return "【错误】未设置 DEEPSEEK_API_KEY 环境变量"
 
     client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
     item_desc = "、".join(
-        f"{k} {WANTED_ITEMS.get(k, '其他')}" for k in items
+        f"{k} {WANTED_ITEMS.get(k, '其他')}" for k in items if k in WANTED_ITEMS
     ) if items else form
+
+    title_hint = f"标题方向：{custom_title}" if custom_title else ""
+    
+    # 如果是月度常规披露，在提示中说明
+    routine_hint = ""
+    if is_routine:
+        routine_hint = "这是公司每月例行披露的高管持股变动或内部人交易，属于常规治理信息，不是突发事件。请按「月度常规披露」的定位撰写，语气平和，不要过度解读。"
 
     user_prompt = f"""公司：{company_name}
 股票代码：{ticker}
 提交时间（美东）：{accepted_et.strftime('%Y-%m-%d %H:%M')} ET
 文件类型：{form}
 涉及事项：{item_desc}
+{routine_hint}
+{title_hint}
 
 原始材料：
 {content}
@@ -513,12 +550,9 @@ _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
 def check_numbers(copy_text: str, source_text: str) -> list:
-    """校验：文案里出现的数字，原文里是否存在（修复版：支持 4 815 -> 48.15）。"""
     def normalize(s):
-        # 移除逗号、空格、货币符号、单位词
         s = s.replace(",", "").replace(" ", "")
         s = re.sub(r'[€$¥]', '', s)
-        # 移除"亿欧元"、"万欧元"等单位
         s = re.sub(r'[亿万]欧元?', '', s)
         return s
 
@@ -536,15 +570,13 @@ def check_numbers(copy_text: str, source_text: str) -> list:
     return sorted(set(suspicious))
 
 
-# ==================== 主流程 ====================
+# ==================== SEC 处理流程 ====================
 
 def process_company(ticker: str, cik: int, seen: set):
-    """返回该公司本次新产出的结果列表。异常粒度下沉到单份文件。"""
     results = []
     filings = list_filings(cik, lookback_days=DAYS_LOOKBACK)
 
     if not filings:
-        print(f"  ℹ️  最近 {DAYS_LOOKBACK} 天无新申报")
         return results
 
     for f in filings:
@@ -554,6 +586,10 @@ def process_company(ticker: str, cik: int, seen: set):
             continue
 
         decision, reason = should_process(f)
+        
+        # 判断是否为月度常规 6-K
+        is_routine_6k = (decision == "6-K_ROUTINE")
+
         if decision is False:
             print(f"  ⏭️  跳过 {acc} - {reason}")
             seen.add(acc)
@@ -577,6 +613,7 @@ def process_company(ticker: str, cik: int, seen: set):
         if is_alert:
             print(f"  🚨 高优先级事件: {','.join(set(f['items']) & ALERT_ITEMS)}")
 
+        # 生成文案，传入 is_routine 参数
         copy_text = generate_copy(
             built["text"],
             COMPANIES.get(ticker, ticker),
@@ -584,6 +621,7 @@ def process_company(ticker: str, cik: int, seen: set):
             f["accepted_et"],
             f["items"],
             f["form"],
+            is_routine=is_routine_6k
         )
 
         warnings = []
@@ -597,6 +635,10 @@ def process_company(ticker: str, cik: int, seen: set):
                 warnings.append(f"数字未在原文中找到: {', '.join(bad)}")
                 print(f"  ⚠️  数字校验告警: {', '.join(bad)}")
 
+        # 如果是 routine 6-K，添加标记
+        if is_routine_6k:
+            warnings.append("月度常规披露，非突发事件")
+
         results.append({
             "ticker": ticker,
             "company": COMPANIES.get(ticker, ticker),
@@ -609,6 +651,8 @@ def process_company(ticker: str, cik: int, seen: set):
             "copy": copy_text,
             "warnings": warnings,
             "alert": is_alert,
+            "source": "SEC",
+            "is_routine": is_routine_6k
         })
         seen.add(acc)
         print(f"  ✅ {acc} 完成（材料 {len(built['text'])} 字符）")
@@ -616,32 +660,88 @@ def process_company(ticker: str, cik: int, seen: set):
     return results
 
 
+# ==================== TechCrunch 处理流程 ====================
+
+def process_techcrunch(articles: list) -> list:
+    """处理 TechCrunch 文章，生成小红书文案"""
+    results = []
+
+    for article in articles:
+        # 生成一个简短的标题提示
+        title_hint = article['title'].replace('|', ' ').replace('\n', ' ')
+
+        copy_text = generate_copy(
+            content=f"标题：{article['title']}\n\n摘要：{article['summary']}\n\n原文链接：{article['link']}",
+            company_name=", ".join([COMPANIES.get(t, t) for t in article['matched_companies']]),
+            ticker=",".join(article['matched_companies'][:3]),
+            accepted_et=datetime.now(ET),
+            items=["TechCrunch 报道"],
+            form="TechCrunch",
+            custom_title=title_hint[:100],
+            is_routine=False
+        )
+
+        results.append({
+            "ticker": ",".join(article['matched_companies'][:3]),
+            "company": ", ".join([COMPANIES.get(t, t) for t in article['matched_companies']]),
+            "form": "TechCrunch",
+            "accepted_et": datetime.now(ET),
+            "accession": f"TC_{int(time.time())}",
+            "items": ["TechCrunch 报道"],
+            "url": article['link'],
+            "exhibits": [],
+            "copy": copy_text,
+            "warnings": ["请人工复核数据准确性"] if "【生成失败】" not in copy_text else ["生成失败"],
+            "alert": False,
+            "source": "TechCrunch",
+            "is_routine": False
+        })
+
+    return results
+
+
+# ==================== 输出 ====================
+
 def write_outputs(all_results: list, checked: int):
     OUTPUT_DIR.mkdir(exist_ok=True)
     now_et = datetime.now(ET)
 
     for r in all_results:
-        ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
-        path = OUTPUT_DIR / f"{ts}_{r['ticker']}_{r['accession'][-6:]}.md"
+        if r["source"] == "TechCrunch":
+            ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
+            path = OUTPUT_DIR / f"TC_{ts}_{r['ticker']}.md"
+        else:
+            ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
+            path = OUTPUT_DIR / f"{ts}_{r['ticker']}_{r['accession'][-6:]}.md"
+
         with path.open("w", encoding="utf-8") as fh:
             fh.write(f"# {r['company']}\n\n")
             fh.write(f"- 提交时间：{r['accepted_et'].strftime('%Y-%m-%d %H:%M')} ET\n")
             fh.write(f"- 类型：{r['form']}　事项：{', '.join(r['items']) or '—'}\n")
             fh.write(f"- 原文：{r['url']}\n")
-            for ex in r["exhibits"]:
-                fh.write(f"- 附件：{ex}\n")
+            if r["exhibits"]:
+                for ex in r["exhibits"]:
+                    fh.write(f"- 附件：{ex}\n")
+            if r["is_routine"]:
+                fh.write(f"- 📌 月度常规披露\n")
             if r["warnings"]:
                 fh.write(f"- ⚠️ 告警：{'；'.join(r['warnings'])}\n")
             fh.write("\n---\n\n")
             fh.write(r["copy"])
 
+    # 汇总
     summary = OUTPUT_DIR / f"summary_{now_et.strftime('%Y%m%d_%H%M')}.md"
     with summary.open("w", encoding="utf-8") as fh:
-        fh.write("# SEC 申报监控汇总\n\n")
+        fh.write("# 监控汇总\n\n")
         fh.write(f"生成时间：{now_et.strftime('%Y-%m-%d %H:%M')} ET\n\n")
-        fh.write(f"监控公司：{checked} 家　产出文案：{len(all_results)} 条\n\n")
+        fh.write(f"监控公司：{checked} 家　产出：{len(all_results)} 条\n\n")
+        fh.write(f"- SEC 申报：{len([r for r in all_results if r['source'] == 'SEC'])} 条\n")
+        fh.write(f"- TechCrunch：{len([r for r in all_results if r['source'] == 'TechCrunch'])} 条\n")
+        routine_count = len([r for r in all_results if r.get('is_routine', False)])
+        if routine_count:
+            fh.write(f"- 月度常规披露：{routine_count} 条\n\n")
 
-        alerts = [r for r in all_results if r["alert"]]
+        alerts = [r for r in all_results if r.get("alert", False)]
         if alerts:
             fh.write("## 🚨 高优先级\n\n")
             for r in alerts:
@@ -650,8 +750,8 @@ def write_outputs(all_results: list, checked: int):
 
         fh.write("---\n\n")
         for i, r in enumerate(all_results, 1):
-            fh.write(f"## {i}. {r['company']}"
-                     f"（{r['accepted_et'].strftime('%m-%d %H:%M')} ET）\n\n")
+            routine_label = " 📌月度常规披露" if r.get('is_routine', False) else ""
+            fh.write(f"## {i}. {r['company']}{routine_label}（{r['accepted_et'].strftime('%m-%d %H:%M')} ET）\n\n")
             fh.write(f"事项：{', '.join(r['items']) or r['form']}\n\n")
             fh.write(f"原文：{r['url']}\n\n")
             if r["warnings"]:
@@ -661,12 +761,18 @@ def write_outputs(all_results: list, checked: int):
     return summary
 
 
+# ==================== 主流程 ====================
+
 def main():
     now_et = datetime.now(ET)
     print(f"🚀 开始运行 - {now_et.strftime('%Y-%m-%d %H:%M:%S')} ET")
     print(f"📋 监控公司：{len(COMPANIES)} 家　回溯：{DAYS_LOOKBACK} 天")
     print("-" * 60)
 
+    all_results = []
+    failed = []
+
+    # ===== SEC 监控 =====
     try:
         tmap = load_ticker_map()
     except Exception as e:
@@ -674,8 +780,6 @@ def main():
         return
 
     seen = load_seen()
-    all_results = []
-    failed = []
 
     for idx, ticker in enumerate(COMPANIES, 1):
         cik = tmap.get(ticker.upper())
@@ -693,20 +797,43 @@ def main():
         finally:
             save_seen(seen)
 
+    # ===== TechCrunch 监控 =====
+    print("\n📡 正在抓取 TechCrunch 科技新闻...")
+    try:
+        tc_articles = fetch_techcrunch_news(limit=30)
+        if tc_articles:
+            print(f"  ✅ 找到 {len(tc_articles)} 篇与监控公司相关的文章")
+            for article in tc_articles:
+                print(f"    📄 {article['title'][:60]}... -> {', '.join(article['matched_companies'])}")
+            all_results.extend(process_techcrunch(tc_articles))
+        else:
+            print("  ℹ️ 暂无监控公司相关新闻")
+    except Exception as e:
+        print(f"  ❌ TechCrunch 抓取失败：{e}")
+
+    # ===== 输出 =====
     print("-" * 60)
     if all_results:
         path = write_outputs(all_results, len(COMPANIES))
+        sec_count = len([r for r in all_results if r['source'] == 'SEC'])
+        tc_count = len([r for r in all_results if r['source'] == 'TechCrunch'])
+        routine_count = len([r for r in all_results if r.get('is_routine', False)])
         warned = [r for r in all_results if r["warnings"]]
+
         print(f"✅ 完成：产出 {len(all_results)} 条文案")
+        print(f"   - SEC：{sec_count} 条")
+        print(f"   - TechCrunch：{tc_count} 条")
+        if routine_count:
+            print(f"   - 月度常规披露：{routine_count} 条")
         if warned:
-            print(f"⚠️  {len(warned)} 条带告警，发布前必须人工复核：")
+            print(f"⚠️  {len(warned)} 条带告警，发布前人工复核：")
             for r in warned:
                 print(f"     {r['ticker']}: {'；'.join(r['warnings'])}")
         if failed:
-            print(f"❌ {len(failed)} 家抓取失败：{', '.join(failed)}")
+            print(f"❌ {len(failed)} 家公司抓取失败：{', '.join(failed)}")
         print(f"📁 汇总：{path.absolute()}")
     else:
-        print("📭 本次没有新的可用申报")
+        print("📭 本次没有新的可用内容")
         if failed:
             print(f"❌ 抓取失败：{', '.join(failed)}")
 
