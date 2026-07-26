@@ -11,6 +11,7 @@ import os
 import re
 import json
 import time
+import hashlib
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -244,6 +245,8 @@ def list_filings(cik: int, forms=("8-K", "6-K"), lookback_days=3):
             "base": base,
             "full_txt_url": f"{base}/{acc_dash}.txt",
             "primary_url": f"{base}/{rec['primaryDocument'][i]}",
+            # 6-K 没有 Item 代码，这个字段是判断它讲什么的唯一结构化线索
+            "doc_desc": (rec.get("primaryDocDescription") or [""] * n)[i] or "",
         })
 
     return out
@@ -359,27 +362,24 @@ def should_process(filing: dict) -> tuple:
     items = filing["items"]
 
     if filing["form"] == "6-K":
-        # 6-K 全部保留，但标记类型供后续处理参考
-        url = filing.get("primary_url", "")
-        is_routine = False
-        routine_reason = ""
+        # 6-K 没有 Item 代码。primaryDocDescription 是 submissions API 里
+        # 唯一说明这份文件讲什么的结构化字段——比在 URL 文件名里
+        # 找关键词靠谱得多（文件名通常只是 form6k.htm）。
+        haystack = f"{filing.get('doc_desc', '')} {filing.get('primary_url', '')}".lower()
 
         ROUTINE_KEYWORDS = [
-            "monthend",      # 月度持股变动
-            "insider",       # 内部人交易
-            "shareholding",  # 持股变动
-            "exempt",        # 豁免申报
-            "beneficial",    # 受益所有权变动
+            "month end", "monthend", "monthly",     # 月度持股/股本变动
+            "insider", "shareholding", "share holding",
+            "beneficial", "exempt",
+            "total voting rights", "share capital",
+            "transaction in own shares", "buy-back", "buyback",
+            "director", "pdmr",                     # 董监高交易申报
         ]
 
         for kw in ROUTINE_KEYWORDS:
-            if kw in url.lower():
-                is_routine = True
-                routine_reason = kw
-                break
+            if kw in haystack:
+                return "6-K_ROUTINE", f"6-K 常规披露（{kw}）"
 
-        if is_routine:
-            return "6-K_ROUTINE", f"6-K 琐碎事项（{routine_reason}，但保留）"
         return True, "6-K"
 
     if not items:
@@ -397,59 +397,109 @@ def should_process(filing: dict) -> tuple:
 
 # ==================== TechCrunch RSS 抓取 ====================
 
-# 从 COMPANIES 自动生成搜索关键词
-_COMPANY_SEARCH_TERMS = set()
-for ticker, name in COMPANIES.items():
-    _COMPANY_SEARCH_TERMS.add(ticker.upper())
-    _COMPANY_SEARCH_TERMS.add(ticker.lower())
-    # 提取核心名称（去掉 " Inc."、" Corporation" 等）
-    core = re.sub(r'\s+(Inc\.?|Corp\.?|Corporation|LLC|Ltd\.?|Limited|公司)$', '', name, flags=re.I)
-    _COMPANY_SEARCH_TERMS.add(core)
-    # 如果名称包含括号，也提取括号外的部分
-    if '(' in name:
-        main_name = name.split('(')[0].strip()
-        _COMPANY_SEARCH_TERMS.add(main_name)
-    _COMPANY_SEARCH_TERMS.add(name)
+# 公司别名表。
+# 不能从 COMPANIES 自动生成：那里的值是「英伟达 Nvidia」这种中英混排，
+# 拿去匹配英文原文永远不中。也不能拿 ticker 当关键词——MU / ZS / STX
+# 这类两字母代码做子串匹配会命中 community、museum、must 之类的普通单词。
+ALIASES = {
+    "INTC":  ["intel"],
+    "NOK":   ["nokia"],
+    "AAOI":  ["applied optoelectronics"],
+    "LITE":  ["lumentum"],
+    "MU":    ["micron"],
+    "AAPL":  ["apple"],
+    "MSFT":  ["microsoft"],
+    "NVDA":  ["nvidia"],
+    "GOOGL": ["google", "alphabet", "deepmind"],
+    "AMZN":  ["amazon", "aws"],
+    "META":  ["meta", "facebook", "instagram", "whatsapp"],
+    "AVGO":  ["broadcom", "vmware"],
+    "TSM":   ["tsmc", "taiwan semiconductor"],
+    "AMD":   ["amd", "advanced micro devices"],
+    "QCOM":  ["qualcomm", "snapdragon"],
+    "TXN":   ["texas instruments"],
+    "AMAT":  ["applied materials"],
+    "LRCX":  ["lam research"],
+    "KLAC":  ["kla corporation", "kla-tencor"],
+    "ADI":   ["analog devices"],
+    "NXPI":  ["nxp semiconductors", "nxp"],
+    "MRVL":  ["marvell"],
+    "ASML":  ["asml"],
+    "SMCI":  ["supermicro", "super micro"],
+    "WDC":   ["western digital", "sandisk"],
+    "SNPS":  ["synopsys"],
+    "CDNS":  ["cadence design", "cadence"],
+    "CSCO":  ["cisco"],
+    "PANW":  ["palo alto networks"],
+    "CRWD":  ["crowdstrike"],
+    "ZS":    ["zscaler"],
+    "FTNT":  ["fortinet"],
+    "PLTR":  ["palantir"],
+    "ANET":  ["arista networks", "arista"],
+    "STX":   ["seagate"],
+}
+
+# 预编译：整词匹配，避免 "amd" 命中 "amds"、"meta" 命中 "metadata"
+_ALIAS_PATTERNS = {
+    ticker: [re.compile(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])", re.I)
+             for a in names]
+    for ticker, names in ALIASES.items()
+}
 
 
-def is_company_mentioned(text: str) -> bool:
-    """检查文本中是否提到监控名单中的公司"""
-    text_lower = text.lower()
-    for term in _COMPANY_SEARCH_TERMS:
-        if term and term.lower() in text_lower:
-            return True
-    return False
+def extract_matched_companies(text: str) -> list:
+    """返回文本中确实提到的监控公司 ticker 列表。"""
+    matched = []
+    for ticker, pats in _ALIAS_PATTERNS.items():
+        if any(p.search(text) for p in pats):
+            matched.append(ticker)
+    return matched
+
+
+def _stable_id(prefix: str, key: str) -> str:
+    """稳定去重键。
+
+    注意不能用内置 hash()：Python 对字符串的 hash 每个进程都随机化，
+    同一条链接每次运行得到的值都不一样，去重会完全失效。
+    """
+    return f"{prefix}_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+
+
+# 摘要短于这个长度就只当线索登记，不生成文案——
+# 光靠一个标题写不出 300 字的准确快讯，只会逼模型编。
+MIN_SUMMARY_CHARS = 180
 
 
 def fetch_techcrunch_news(limit: int = 30):
-    """从 TechCrunch RSS 抓取文章，只保留监控公司相关的"""
+    """从 TechCrunch RSS 抓取文章，只保留监控公司相关的。"""
     try:
         feed = feedparser.parse(TECHCRUNCH_RSS_URL)
-        
-        filtered = []
-        for entry in feed.entries[:limit]:
-            full_text = entry.title + " " + entry.summary
-            if is_company_mentioned(full_text):
-                # 找出具体提到了哪家公司
-                matched = []
-                for ticker, name in COMPANIES.items():
-                    if ticker.upper() in full_text.upper() or name in full_text:
-                        if ticker not in matched:
-                            matched.append(ticker)
-                
-                filtered.append({
-                    "title": entry.title,
-                    "link": entry.link,
-                    "summary": entry.summary,
-                    "published": entry.get("published", ""),
-                    "source": "TechCrunch",
-                    "matched_companies": matched
-                })
-        
-        return filtered
     except Exception as e:
         print(f"  ⚠️ TechCrunch RSS 抓取失败: {e}")
         return []
+
+    if getattr(feed, "bozo", 0) and not feed.entries:
+        print(f"  ⚠️ RSS 解析异常: {getattr(feed, 'bozo_exception', '未知')}")
+        return []
+
+    out = []
+    for entry in feed.entries[:limit]:
+        title = entry.get("title", "")
+        summary = clean_html(entry.get("summary", ""))
+        matched = extract_matched_companies(f"{title} {summary}")
+        if not matched:
+            continue
+        out.append({
+            "id": _stable_id("TC", entry.get("link", title)),
+            "title": title,
+            "link": entry.get("link", ""),
+            "summary": summary,
+            "published": entry.get("published", ""),
+            "source": "TechCrunch",
+            "matched_companies": matched,
+            "thin": len(summary) < MIN_SUMMARY_CHARS,
+        })
+    return out
 
 
 # ==================== 文案生成 ====================
@@ -461,6 +511,7 @@ SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与�
 第一行：📡 [核心消息标题]，20字以内，以 emoji 开头
 第二行：空行
 第三行：📅 [日期]，[公司全名]（[股票代码]）发布[公告类型]
+        日期与时间一律使用美东时间（ET），全文不得出现北京时间或其他时区。
 第四行：空行
 第五行：一句话总括，带 emoji 和 👇
 第六行：空行
@@ -475,6 +526,7 @@ SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与�
 ─── 📊 [段落二标题] ───
 💵 [财务数据要点]
 📉 [变化说明]
+（若材料中没有财务数据，整段省略，不要编造数字来填满模板）
 
 ─── 💡 [段落三标题] ───
 [管理层解读或影响分析]
@@ -491,10 +543,32 @@ SYSTEM_PROMPT = """你是 星火速报 的撰稿人，为小红书写美股与�
 文风规范：
 1. 语气平实、克制，像朋友聊天，不夸张、不煽动
 2. 用口语化表达，避免生硬书面语
-3. 所有数字必须与原文完全一致
-4. 不使用 markdown 标题符号
-5. 全文 300-500 字
-6. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」"""
+3. 所有数字必须与原文完全一致，材料里没有的数字一律不得出现
+4. 段落是可选的：材料支撑不了某一段就整段删掉，模板服从事实，不是反过来
+5. 不使用 markdown 标题符号
+6. 全文 300-500 字
+7. 如果材料信息不足以支撑一条完整快讯，直接输出「材料不足」"""
+
+
+# TechCrunch 只有标题 + 一小段摘要，撑不起上面那套四段模板。
+# 单独一套短格式，并且明确要求「不要补充材料之外的任何信息」。
+TECHCRUNCH_PROMPT = """你是 星火速报 的撰稿人，为小红书写科技新闻短讯。
+
+材料来自 TechCrunch 的 RSS 摘要，信息量有限。严格遵守：
+
+1. 只写材料中明确出现的内容。材料没提到的数字、金额、时间、人名、
+   产品参数、因果关系，一律不得补充——哪怕你知道相关背景也不行。
+2. 用转述，不要整句照搬原文措辞。
+3. 篇幅 120-200 字，不要为了凑长度而展开。
+4. 日期时间一律用美东时间（ET）。
+5. 格式：
+   第一行：📡 [标题，20字以内]
+   空行
+   正文 2-3 段短句
+   空行
+   ─ 📌 来源：TechCrunch ─
+   [3-5 个话题标签]
+6. 如果材料只够写一个标题、无法支撑一条独立短讯，直接输出「材料不足」。"""
 
 
 def generate_copy(content: str, company_name: str, ticker: str,
@@ -533,7 +607,8 @@ def generate_copy(content: str, company_name: str, ticker: str,
         resp = client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system",
+                 "content": TECHCRUNCH_PROMPT if form == "TechCrunch" else SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
@@ -548,22 +623,37 @@ def generate_copy(content: str, company_name: str, ticker: str,
 
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
+# 日期和时间会被拆成一串数字（2026-07-26 -> 2026 / 07 / 26），
+# 而这些数字来自元数据、不在原文里，不排除掉的话每条文案都会误报。
+_DATE_LIKE = re.compile(
+    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?"   # 2026-07-26 / 2026年7月26日
+    r"|\d{1,2}\s*[-/月]\s*\d{1,2}\s*日"                       # 7月26日
+    r"|\d{1,2}:\d{2}"                                          # 16:05
+    r"|Q[1-4]|[一二三四]季度|第[1-4一二三四]季度"
+)
 
-def check_numbers(copy_text: str, source_text: str) -> list:
+
+def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> list:
+    """校验文案里的数字是否都能在原始材料中找到。
+
+    extra_allowed 用来放元数据里合法带入的内容（提交时间、股票代码等）。
+    """
     def normalize(s):
         s = s.replace(",", "").replace(" ", "")
-        s = re.sub(r'[€$¥]', '', s)
-        s = re.sub(r'[亿万]欧元?', '', s)
+        s = re.sub(r"[€$¥]", "", s)
+        s = re.sub(r"[亿万]欧元?", "", s)
         return s
 
-    src = normalize(source_text)
+    src = normalize(source_text + " " + extra_allowed)
+    cleaned = _DATE_LIKE.sub(" ", copy_text)
+
     suspicious = []
-    for m in _NUM.finditer(copy_text):
+    for m in _NUM.finditer(cleaned):
         raw = m.group()
         val = normalize(raw)
         if len(val.replace(".", "")) <= 1:
             continue
-        if re.fullmatch(r"(19|20)\d{2}", val):
+        if re.fullmatch(r"(19|20)\d{2}", val):      # 年份
             continue
         if val not in src:
             suspicious.append(raw)
@@ -630,7 +720,9 @@ def process_company(ticker: str, cik: int, seen: set):
         elif copy_text.strip() == "材料不足":
             warnings.append("模型判定材料不足")
         else:
-            bad = check_numbers(copy_text, built["text"])
+            bad = check_numbers(
+                copy_text, built["text"],
+                extra_allowed=f"{f['accepted_et'].strftime('%Y-%m-%d %H:%M')} {ticker}")
             if bad:
                 warnings.append(f"数字未在原文中找到: {', '.join(bad)}")
                 print(f"  ⚠️  数字校验告警: {', '.join(bad)}")
@@ -662,40 +754,88 @@ def process_company(ticker: str, cik: int, seen: set):
 
 # ==================== TechCrunch 处理流程 ====================
 
-def process_techcrunch(articles: list) -> list:
-    """处理 TechCrunch 文章，生成小红书文案"""
+def process_techcrunch(articles: list, seen: set) -> list:
+    """处理 TechCrunch 文章。
+
+    和 SEC 那条路径共用同一个 seen 集合与同一套数字校验——
+    之前这两样在 TechCrunch 上都是绕过的。
+    """
     results = []
 
     for article in articles:
-        # 生成一个简短的标题提示
-        title_hint = article['title'].replace('|', ' ').replace('\n', ' ')
+        aid = article["id"]
+        if aid in seen:
+            print(f"    ⏭️  已处理过: {article['title'][:50]}")
+            continue
+
+        # 摘要太短就只登记线索，不烧 API，也不给模型编造的机会
+        if article["thin"]:
+            print(f"    📎 线索（摘要过短，不生成文案）: {article['title'][:50]}")
+            results.append({
+                "ticker": ",".join(article["matched_companies"][:3]),
+                "company": ", ".join(COMPANIES.get(t, t) for t in article["matched_companies"]),
+                "form": "TechCrunch",
+                "accepted_et": datetime.now(ET),
+                "accession": aid,
+                "items": ["TechCrunch 线索"],
+                "url": article["link"],
+                "exhibits": [],
+                "copy": "（仅登记线索，摘要信息不足以生成文案。建议顺着链接找原始信源后手写。）",
+                "warnings": ["线索，未生成文案"],
+                "alert": False,
+                "source": "TechCrunch",
+                "is_routine": False,
+                "lead_only": True,
+            })
+            seen.add(aid)
+            continue
+
+        content = (f"标题：{article['title']}\n\n"
+                   f"摘要：{article['summary']}\n\n"
+                   f"原文链接：{article['link']}")
 
         copy_text = generate_copy(
-            content=f"标题：{article['title']}\n\n摘要：{article['summary']}\n\n原文链接：{article['link']}",
-            company_name=", ".join([COMPANIES.get(t, t) for t in article['matched_companies']]),
-            ticker=",".join(article['matched_companies'][:3]),
+            content=content,
+            company_name=", ".join(COMPANIES.get(t, t) for t in article["matched_companies"]),
+            ticker=",".join(article["matched_companies"][:3]),
             accepted_et=datetime.now(ET),
             items=["TechCrunch 报道"],
             form="TechCrunch",
-            custom_title=title_hint[:100],
-            is_routine=False
+            custom_title=article["title"].replace("|", " ").replace("\n", " ")[:100],
+            is_routine=False,
         )
 
+        warnings = ["二手信源，建议核对原始信源后再发布"]
+        if copy_text.startswith("【生成失败】") or copy_text.startswith("【错误】"):
+            warnings = ["生成失败"]
+        elif copy_text.strip() == "材料不足":
+            warnings = ["模型判定材料不足"]
+        else:
+            bad = check_numbers(
+                copy_text, content,
+                extra_allowed=",".join(article["matched_companies"]))
+            if bad:
+                warnings.append(f"数字未在原文中找到: {', '.join(bad)}")
+                print(f"    ⚠️  数字校验告警: {', '.join(bad)}")
+
         results.append({
-            "ticker": ",".join(article['matched_companies'][:3]),
-            "company": ", ".join([COMPANIES.get(t, t) for t in article['matched_companies']]),
+            "ticker": ",".join(article["matched_companies"][:3]),
+            "company": ", ".join(COMPANIES.get(t, t) for t in article["matched_companies"]),
             "form": "TechCrunch",
             "accepted_et": datetime.now(ET),
-            "accession": f"TC_{int(time.time())}",
+            "accession": aid,
             "items": ["TechCrunch 报道"],
-            "url": article['link'],
+            "url": article["link"],
             "exhibits": [],
             "copy": copy_text,
-            "warnings": ["请人工复核数据准确性"] if "【生成失败】" not in copy_text else ["生成失败"],
+            "warnings": warnings,
             "alert": False,
             "source": "TechCrunch",
-            "is_routine": False
+            "is_routine": False,
+            "lead_only": False,
         })
+        seen.add(aid)
+        print(f"    ✅ {article['title'][:50]}")
 
     return results
 
@@ -707,12 +847,16 @@ def write_outputs(all_results: list, checked: int):
     now_et = datetime.now(ET)
 
     for r in all_results:
-        if r["source"] == "TechCrunch":
-            ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
-            path = OUTPUT_DIR / f"TC_{ts}_{r['ticker']}.md"
+        ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
+        safe_ticker = r["ticker"].replace(",", "-")[:20] or "NA"
+        suffix = r["accession"][-6:]
+        if r.get("lead_only"):
+            path = OUTPUT_DIR / "leads" / f"{ts}_{safe_ticker}_{suffix}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        elif r["source"] == "TechCrunch":
+            path = OUTPUT_DIR / f"TC_{ts}_{safe_ticker}_{suffix}.md"
         else:
-            ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
-            path = OUTPUT_DIR / f"{ts}_{r['ticker']}_{r['accession'][-6:]}.md"
+            path = OUTPUT_DIR / f"{ts}_{safe_ticker}_{suffix}.md"
 
         with path.open("w", encoding="utf-8") as fh:
             fh.write(f"# {r['company']}\n\n")
@@ -722,7 +866,7 @@ def write_outputs(all_results: list, checked: int):
             if r["exhibits"]:
                 for ex in r["exhibits"]:
                     fh.write(f"- 附件：{ex}\n")
-            if r["is_routine"]:
+            if r.get("is_routine"):
                 fh.write(f"- 📌 月度常规披露\n")
             if r["warnings"]:
                 fh.write(f"- ⚠️ 告警：{'；'.join(r['warnings'])}\n")
@@ -734,22 +878,33 @@ def write_outputs(all_results: list, checked: int):
     with summary.open("w", encoding="utf-8") as fh:
         fh.write("# 监控汇总\n\n")
         fh.write(f"生成时间：{now_et.strftime('%Y-%m-%d %H:%M')} ET\n\n")
-        fh.write(f"监控公司：{checked} 家　产出：{len(all_results)} 条\n\n")
-        fh.write(f"- SEC 申报：{len([r for r in all_results if r['source'] == 'SEC'])} 条\n")
-        fh.write(f"- TechCrunch：{len([r for r in all_results if r['source'] == 'TechCrunch'])} 条\n")
+        drafts = [r for r in all_results if not r.get("lead_only")]
+        leads = [r for r in all_results if r.get("lead_only")]
+
+        fh.write(f"监控公司：{checked} 家　可用文案：{len(drafts)} 条\n\n")
+        fh.write(f"- SEC 申报：{len([r for r in drafts if r['source'] == 'SEC'])} 条\n")
+        fh.write(f"- TechCrunch：{len([r for r in drafts if r['source'] == 'TechCrunch'])} 条\n")
+        if leads:
+            fh.write(f"- TechCrunch 线索（未生成文案）：{len(leads)} 条\n")
         routine_count = len([r for r in all_results if r.get('is_routine', False)])
         if routine_count:
             fh.write(f"- 月度常规披露：{routine_count} 条\n\n")
 
-        alerts = [r for r in all_results if r.get("alert", False)]
+        alerts = [r for r in drafts if r.get("alert", False)]
         if alerts:
             fh.write("## 🚨 高优先级\n\n")
             for r in alerts:
                 fh.write(f"- {r['company']}　{', '.join(r['items'])}　{r['url']}\n")
             fh.write("\n")
 
+        if leads:
+            fh.write("## 📎 线索（信息不足，需自行找原始信源）\n\n")
+            for r in leads:
+                fh.write(f"- [{r['ticker']}] {r['url']}\n")
+            fh.write("\n")
+
         fh.write("---\n\n")
-        for i, r in enumerate(all_results, 1):
+        for i, r in enumerate(drafts, 1):
             routine_label = " 📌月度常规披露" if r.get('is_routine', False) else ""
             fh.write(f"## {i}. {r['company']}{routine_label}（{r['accepted_et'].strftime('%m-%d %H:%M')} ET）\n\n")
             fh.write(f"事项：{', '.join(r['items']) or r['form']}\n\n")
@@ -804,8 +959,10 @@ def main():
         if tc_articles:
             print(f"  ✅ 找到 {len(tc_articles)} 篇与监控公司相关的文章")
             for article in tc_articles:
-                print(f"    📄 {article['title'][:60]}... -> {', '.join(article['matched_companies'])}")
-            all_results.extend(process_techcrunch(tc_articles))
+                tag = "线索" if article["thin"] else "可用"
+                print(f"    📄 [{tag}] {article['title'][:55]} -> {', '.join(article['matched_companies'])}")
+            all_results.extend(process_techcrunch(tc_articles, seen))
+            save_seen(seen)
         else:
             print("  ℹ️ 暂无监控公司相关新闻")
     except Exception as e:
@@ -816,13 +973,17 @@ def main():
     if all_results:
         path = write_outputs(all_results, len(COMPANIES))
         sec_count = len([r for r in all_results if r['source'] == 'SEC'])
-        tc_count = len([r for r in all_results if r['source'] == 'TechCrunch'])
+        tc_count = len([r for r in all_results
+                        if r['source'] == 'TechCrunch' and not r.get('lead_only')])
+        lead_count = len([r for r in all_results if r.get('lead_only')])
         routine_count = len([r for r in all_results if r.get('is_routine', False)])
         warned = [r for r in all_results if r["warnings"]]
 
-        print(f"✅ 完成：产出 {len(all_results)} 条文案")
+        print(f"✅ 完成：产出 {len(all_results) - lead_count} 条文案")
         print(f"   - SEC：{sec_count} 条")
         print(f"   - TechCrunch：{tc_count} 条")
+        if lead_count:
+            print(f"   - TechCrunch 线索（未生成文案）：{lead_count} 条")
         if routine_count:
             print(f"   - 月度常规披露：{routine_count} 条")
         if warned:
