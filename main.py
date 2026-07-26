@@ -73,7 +73,7 @@ DAYS_LOOKBACK = 30
 # 4. DeepSeek 配置（从环境变量读取，不要写死在代码里）
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"  # 正确的模型名
+DEEPSEEK_MODEL = "deepseek-v4-flash"  # 正确的模型名
 
 # ==================== 以下代码一般不用改 ====================
 
