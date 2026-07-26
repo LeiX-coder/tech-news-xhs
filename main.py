@@ -17,7 +17,7 @@ from openai import OpenAI
 # ==================== 配置区域（你只需要改这里） ====================
 
 # 1. 你的身份（SEC 要求，随便写真实一点的邮箱就行）
-SEC_IDENTITY = "YourName your-email@example.com"
+SEC_IDENTITY = "xiaolei xiaolei12555@126.com"
 
 # 2. 要监控的公司（ticker + 中文名）
 COMPANIES = {
