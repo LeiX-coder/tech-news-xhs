@@ -1,0 +1,4 @@
+edgartools
+openai
+requests
+python-dotenv
