@@ -193,6 +193,15 @@ MAX_WEB_CANDIDATES = 8
 # state 来不及提交。SEC 阶段不设限，那条线才是主力信源。
 WEB_PHASE_BUDGET_SEC = 1200
 
+# ---- 保留策略 ----
+# output/ 只留 summary_*.md，且只留最近 N 天（按文件名里的日期，不按 mtime）
+OUTPUT_RETENTION_DAYS = 3
+# 是否为每条内容单独写一个 .md。关掉后所有文案都只存在于 summary 里。
+KEEP_INDIVIDUAL_FILES = False
+# state 的保留期必须 > DAYS_LOOKBACK，否则一条申报还在回溯窗口里、
+# 去重记录却已经被裁掉，会重复处理、重复调 API。
+STATE_RETENTION_DAYS = DAYS_LOOKBACK + 4
+
 # 白名单 Item
 WANTED_ITEMS = {
     "1.01": "签署重大协议",
@@ -342,19 +351,63 @@ def parse_accepted_et(raw: str, fallback_date: str) -> datetime:
     return datetime.fromisoformat(fallback_date).replace(tzinfo=ET)
 
 
-def load_seen() -> set:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            return set()
-    return set()
+class SeenStore:
+    """
+    去重记录。存成 {id: "YYYY-MM-DD"}，带上日期才能按时间裁剪。
+    对外仍然是 `x in seen` / `seen.add(x)`，调用处不用改。
+    兼容旧的扁平数组格式（首次读到会自动迁移，日期记为今天）。
+    """
+
+    def __init__(self, data=None):
+        self._d = dict(data or {})
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def __len__(self):
+        return len(self._d)
+
+    def add(self, key):
+        # setdefault：已存在就保留原始日期，不要每次运行都刷新成今天，
+        # 否则永远裁不掉。
+        self._d.setdefault(key, datetime.now(ET).strftime("%Y-%m-%d"))
+
+    def prune(self, days: int) -> int:
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+        before = len(self._d)
+        self._d = {k: v for k, v in self._d.items() if v >= cutoff}
+        return before - len(self._d)
+
+    def to_dict(self) -> dict:
+        return dict(sorted(self._d.items()))
 
 
-def save_seen(seen: set):
+def load_seen() -> SeenStore:
+    if not SEEN_FILE.exists():
+        return SeenStore()
+    try:
+        raw = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return SeenStore()
+
+    if isinstance(raw, dict):
+        return SeenStore(raw)
+
+    # 旧格式：扁平数组，没有日期。迁移时统一记为今天，
+    # 意味着迁移后第一次裁剪要等 STATE_RETENTION_DAYS 天，属预期行为。
+    if isinstance(raw, list):
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        print(f"  🔄 seen 迁移：{len(raw)} 条旧格式记录 → 带日期格式")
+        return SeenStore({k: today for k in raw})
+
+    return SeenStore()
+
+
+def save_seen(seen: SeenStore):
     STATE_DIR.mkdir(exist_ok=True)
     SEEN_FILE.write_text(
-        json.dumps(sorted(seen), ensure_ascii=False, indent=0), encoding="utf-8"
+        json.dumps(seen.to_dict(), ensure_ascii=False, indent=0, sort_keys=True),
+        encoding="utf-8",
     )
 
 # ==================== 通用正文 / 日期提取 ====================
@@ -1442,39 +1495,99 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
 # ==================== 输出 ====================
 
 
+# 从文件名里抠日期：summary_20260728_1240.md / 20260728-1240_MU_a1b2c3.md
+_FNAME_DATE = re.compile(r"(20\d{6})[_-]\d{4}")
+
+
+def _file_date(path: Path):
+    """
+    优先按文件名解析日期。
+    绝不能只依赖 mtime：Actions 每次都是全新 checkout，
+    git 会把所有文件的 mtime 设成签出那一刻，按 mtime 判断永远删不掉东西。
+    """
+    m = _FNAME_DATE.search(path.name)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=ET)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=ET)
+    except OSError:
+        return None
+
+
+def cleanup_outputs() -> tuple:
+    """
+    output/ 的保留策略：
+    1. 只留 summary_*.md，其余（单条文案、leads）一律删除；
+    2. summary 只留最近 OUTPUT_RETENTION_DAYS 个自然日。
+    在写新内容之前跑，删掉的文件由 workflow 的 `git add -A` 带上删除记录。
+    """
+    if not OUTPUT_DIR.exists():
+        return 0, 0
+
+    cutoff_date = (datetime.now(ET) - timedelta(days=OUTPUT_RETENTION_DAYS)).date()
+    dropped_non_summary = 0
+    dropped_expired = 0
+
+    for p in sorted(OUTPUT_DIR.rglob("*")):
+        if p.is_dir() or p.name.startswith("."):
+            continue
+        if not p.name.startswith("summary_"):
+            p.unlink(missing_ok=True)
+            dropped_non_summary += 1
+            continue
+        d = _file_date(p)
+        if d and d.date() < cutoff_date:
+            p.unlink(missing_ok=True)
+            dropped_expired += 1
+
+    # 收掉空目录（比如 output/leads/）
+    for p in sorted(OUTPUT_DIR.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+        if p.is_dir():
+            try:
+                p.rmdir()
+            except OSError:
+                pass
+
+    return dropped_non_summary, dropped_expired
+
+
 def write_outputs(all_results: list, checked: int):
     OUTPUT_DIR.mkdir(exist_ok=True)
     now_et = datetime.now(ET)
 
-    for r in all_results:
-        ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
-        safe_ticker = r["ticker"].replace(",", "-")[:20] or "NA"
-        suffix = r["accession"][-6:]
-        if r.get("lead_only"):
-            path = OUTPUT_DIR / "leads" / f"{ts}_{safe_ticker}_{suffix}.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-        elif r["source"] == "TechCrunch":
-            path = OUTPUT_DIR / f"TC_{ts}_{safe_ticker}_{suffix}.md"
-        elif r["source"] == "官网":
-            path = OUTPUT_DIR / f"WEB_{ts}_{safe_ticker}_{suffix}.md"
-        else:
-            path = OUTPUT_DIR / f"{ts}_{safe_ticker}_{suffix}.md"
+    if KEEP_INDIVIDUAL_FILES:
+        for r in all_results:
+            ts = r["accepted_et"].strftime("%Y%m%d-%H%M")
+            safe_ticker = r["ticker"].replace(",", "-")[:20] or "NA"
+            suffix = r["accession"][-6:]
+            if r.get("lead_only"):
+                path = OUTPUT_DIR / "leads" / f"{ts}_{safe_ticker}_{suffix}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+            elif r["source"] == "TechCrunch":
+                path = OUTPUT_DIR / f"TC_{ts}_{safe_ticker}_{suffix}.md"
+            elif r["source"] == "官网":
+                path = OUTPUT_DIR / f"WEB_{ts}_{safe_ticker}_{suffix}.md"
+            else:
+                path = OUTPUT_DIR / f"{ts}_{safe_ticker}_{suffix}.md"
 
-        with path.open("w", encoding="utf-8") as fh:
-            fh.write(f"# {r['company']}\n\n")
-            fh.write(f"- 时间：{r['accepted_et'].strftime('%Y-%m-%d %H:%M')} ET\n")
-            fh.write(f"- 类型：{r['form']}　事项：{', '.join(r['items']) or '—'}\n")
-            fh.write(f"- 原文：{r['url']}\n")
-            fh.write(f"- 材料长度：{r.get('material_chars', 0)} 字符\n")
-            if r["exhibits"]:
-                for ex in r["exhibits"]:
-                    fh.write(f"- 附件：{ex}\n")
-            if r.get("is_routine"):
-                fh.write("- 📌 月度常规披露\n")
-            if r["warnings"]:
-                fh.write(f"- ⚠️ 告警：{'；'.join(r['warnings'])}\n")
-            fh.write("\n---\n\n")
-            fh.write(r["copy"])
+            with path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# {r['company']}\n\n")
+                fh.write(f"- 时间：{r['accepted_et'].strftime('%Y-%m-%d %H:%M')} ET\n")
+                fh.write(f"- 类型：{r['form']}　事项：{', '.join(r['items']) or '—'}\n")
+                fh.write(f"- 原文：{r['url']}\n")
+                fh.write(f"- 材料长度：{r.get('material_chars', 0)} 字符\n")
+                if r["exhibits"]:
+                    for ex in r["exhibits"]:
+                        fh.write(f"- 附件：{ex}\n")
+                if r.get("is_routine"):
+                    fh.write("- 📌 月度常规披露\n")
+                if r["warnings"]:
+                    fh.write(f"- ⚠️ 告警：{'；'.join(r['warnings'])}\n")
+                fh.write("\n---\n\n")
+                fh.write(r["copy"])
 
     # 汇总
     summary = OUTPUT_DIR / f"summary_{now_et.strftime('%Y%m%d_%H%M')}.md"
@@ -1513,8 +1626,11 @@ def write_outputs(all_results: list, checked: int):
             routine_label = " 📌月度常规披露" if r.get('is_routine', False) else ""
             fh.write(f"## {i}. {r['company']}{routine_label}"
                      f"（{r['accepted_et'].strftime('%m-%d %H:%M')} ET）\n\n")
-            fh.write(f"事项：{', '.join(r['items']) or r['form']}\n\n")
+            fh.write(f"事项：{', '.join(r['items']) or r['form']}　"
+                     f"类型：{r['form']}　材料：{r.get('material_chars', 0)} 字符\n\n")
             fh.write(f"原文：{r['url']}\n\n")
+            for ex in r.get("exhibits") or []:
+                fh.write(f"附件：{ex}\n\n")
             if r["warnings"]:
                 fh.write(f"⚠️ {'；'.join(r['warnings'])}\n\n")
             fh.write(r["copy"] + "\n\n---\n\n")
@@ -1529,6 +1645,12 @@ def main():
     print(f"🚀 开始运行 - {now_et.strftime('%Y-%m-%d %H:%M:%S')} ET")
     print(f"📋 监控公司：{len(COMPANIES)} 家　回溯：{DAYS_LOOKBACK} 天")
     print(f"📏 正文门槛：{MIN_ARTICLE_CHARS} 字符（低于此值只登记线索，不调 API）")
+
+    # ---- 0. 清理 ----
+    dropped_non_summary, dropped_expired = cleanup_outputs()
+    if dropped_non_summary or dropped_expired:
+        print(f"🧹 output 清理：删除非 summary {dropped_non_summary} 个、"
+              f"过期 summary {dropped_expired} 个（保留 {OUTPUT_RETENTION_DAYS} 天）")
     print("-" * 60)
 
     all_results = []
@@ -1542,6 +1664,11 @@ def main():
         tmap = {}
 
     seen = load_seen()
+    pruned = seen.prune(STATE_RETENTION_DAYS)
+    if pruned:
+        print(f"🧹 state 清理：裁掉 {pruned} 条 {STATE_RETENTION_DAYS} 天前的去重记录"
+              f"（剩余 {len(seen)} 条）")
+    save_seen(seen)
 
     for idx, ticker in enumerate(COMPANIES, 1):
         cik = tmap.get(ticker.upper())
