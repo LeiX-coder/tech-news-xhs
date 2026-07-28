@@ -264,7 +264,14 @@ STATS = {
     "skipped_items": 0,       # SEC 条目不在白名单
     "skipped_window": 0,      # 超出回溯窗口
     "fetch_failed": 0,        # 抓取失败
+    "seen_list": [],          # 被去重挡掉的具体条目，用于零产出时排查
 }
+
+
+def _note_seen(ticker: str, label: str):
+    STATS["skipped_seen"] += 1
+    if len(STATS["seen_list"]) < 200:
+        STATS["seen_list"].append(f"[{ticker}] {label}")
 
 # ==================== HTTP 层 ====================
 
@@ -1337,7 +1344,7 @@ def process_company_sec(ticker: str, cik: int, seen: set):
     for f in filings:
         acc = f["accession"]
         if acc in seen:
-            STATS["skipped_seen"] += 1
+            _note_seen(ticker, f"{f['form']} {acc}")
             print(f"  ⏭️  已处理过: {acc}")
             continue
 
@@ -1464,7 +1471,8 @@ def process_techcrunch(articles: list, seen: set) -> list:
     for article in articles:
         aid = article["id"]
         if aid in seen:
-            STATS["skipped_seen"] += 1
+            _note_seen(",".join(article["matched_companies"][:2]),
+                       f"TechCrunch《{article['title'][:60]}》")
             print(f"    ⏭️  已处理过: {article['title'][:50]}")
             continue
 
@@ -1562,7 +1570,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
     for article in articles:
         aid = _stable_id("WEB", article["link"])
         if aid in seen:
-            STATS["skipped_seen"] += 1
+            _note_seen(ticker, f"官网《{article['title'][:60]}》")
             print(f"    ⏭️  已处理: {article['title'][:40]}")
             continue
 
@@ -1816,6 +1824,16 @@ def write_outputs(all_results: list, checked: int):
             if STATS["fetch_failed"] > 0:
                 fh.write("> 「抓取失败」不为零，说明有站点返回了错误或被拦截，"
                          "去运行日志里搜 `⚠️` 看具体是哪几家。\n\n")
+
+            if STATS["seen_list"]:
+                fh.write("### 被去重挡掉的具体条目\n\n")
+                fh.write("下面这些就是本次窗口内的全部内容。"
+                         "它们都不是被内容过滤掉的，而是之前的运行已经处理过。\n\n")
+                for item in STATS["seen_list"]:
+                    fh.write(f"- {item}\n")
+                if STATS["skipped_seen"] > len(STATS["seen_list"]):
+                    fh.write(f"- …（另有 {STATS['skipped_seen'] - len(STATS['seen_list'])} 条未列出）\n")
+                fh.write("\n")
             return summary
 
         fh.write(f"- SEC 申报：{len([r for r in drafts if r['source'] == 'SEC'])} 条\n")
