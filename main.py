@@ -240,6 +240,17 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
+# ---- 版本标识 ----
+# 每份 summary 头部都会写入这个标记。清理时，凡是没有当前标记的 summary
+# 一律删除 —— 这样跑过一次之后，旧版本产出的文件不可能还留在 output/ 里。
+GENERATOR_VERSION = "v2.0"
+VERSION_MARKER = f"<!-- generator:{GENERATOR_VERSION} -->"
+
+# FORCE_RESET=1 时清空去重记录，把回溯窗口内的内容全部重新处理一遍。
+# 用于验证改动效果 —— 否则已处理过的条目永远不会重新生成文案。
+# 注意：会重新消耗 API 额度。
+FORCE_RESET = os.getenv("FORCE_RESET", "").strip().lower() in ("1", "true", "yes")
+
 ET = ZoneInfo("America/New_York")
 SEC = "https://www.sec.gov"
 
@@ -1683,29 +1694,41 @@ def cleanup_outputs() -> tuple:
     """
     output/ 的保留策略：
     1. 只留 summary_*.md，其余（单条文案、leads）一律删除；
-    2. summary 只留最近 OUTPUT_RETENTION_DAYS 个自然日。
-    在写新内容之前跑，删掉的文件由 workflow 的 `git add -A` 带上删除记录。
+    2. summary 只留最近 OUTPUT_RETENTION_DAYS 个自然日；
+    3. 没有当前版本标记的 summary 一律删除 —— 保证跑过一次之后，
+       output/ 里不可能还残留旧版本产出的文件。
     """
     if not OUTPUT_DIR.exists():
-        return 0, 0
+        return 0, 0, 0
 
     cutoff_date = (datetime.now(ET) - timedelta(days=OUTPUT_RETENTION_DAYS)).date()
     dropped_non_summary = 0
     dropped_expired = 0
+    dropped_stale_version = 0
 
     for p in sorted(OUTPUT_DIR.rglob("*")):
         if p.is_dir() or p.name.startswith("."):
             continue
+
         if not p.name.startswith("summary_"):
             p.unlink(missing_ok=True)
             dropped_non_summary += 1
             continue
+
+        try:
+            head = p.read_text(encoding="utf-8", errors="ignore")[:200]
+        except OSError:
+            head = ""
+        if VERSION_MARKER not in head:
+            p.unlink(missing_ok=True)
+            dropped_stale_version += 1
+            continue
+
         d = _file_date(p)
         if d and d.date() < cutoff_date:
             p.unlink(missing_ok=True)
             dropped_expired += 1
 
-    # 收掉空目录（比如 output/leads/）
     for p in sorted(OUTPUT_DIR.rglob("*"), key=lambda x: len(x.parts), reverse=True):
         if p.is_dir():
             try:
@@ -1713,7 +1736,7 @@ def cleanup_outputs() -> tuple:
             except OSError:
                 pass
 
-    return dropped_non_summary, dropped_expired
+    return dropped_non_summary, dropped_expired, dropped_stale_version
 
 
 def write_outputs(all_results: list, checked: int):
@@ -1754,7 +1777,10 @@ def write_outputs(all_results: list, checked: int):
     # 汇总
     summary = OUTPUT_DIR / f"summary_{now_et.strftime('%Y%m%d_%H%M')}.md"
     with summary.open("w", encoding="utf-8") as fh:
+        fh.write(f"{VERSION_MARKER}\n")
         fh.write("# 监控汇总\n\n")
+        fh.write(f"生成器版本：**{GENERATOR_VERSION}**"
+                 f"（RSS 优先 · 正文门槛 {MIN_ARTICLE_CHARS} 字符 · 编造检测已启用）\n\n")
         fh.write(f"生成时间：{now_et.strftime('%Y-%m-%d %H:%M')} ET\n\n")
         drafts = [r for r in all_results if not r.get("lead_only")]
         leads = [r for r in all_results if r.get("lead_only")]
@@ -1804,15 +1830,21 @@ def write_outputs(all_results: list, checked: int):
 
 def main():
     now_et = datetime.now(ET)
+    print("=" * 60)
+    print(f"星火速报监控　生成器版本 {GENERATOR_VERSION}")
+    print(f"脚本路径：{Path(__file__).resolve()}")
+    print("=" * 60)
     print(f"🚀 开始运行 - {now_et.strftime('%Y-%m-%d %H:%M:%S')} ET")
     print(f"📋 监控公司：{len(COMPANIES)} 家　回溯：{DAYS_LOOKBACK} 天")
     print(f"📏 正文门槛：{MIN_ARTICLE_CHARS} 字符（低于此值只登记线索，不调 API）")
+    if FORCE_RESET:
+        print("🔁 FORCE_RESET=1　去重记录将被清空，窗口内内容全部重新处理")
 
     # ---- 0. 清理 ----
-    dropped_non_summary, dropped_expired = cleanup_outputs()
-    if dropped_non_summary or dropped_expired:
-        print(f"🧹 output 清理：删除非 summary {dropped_non_summary} 个、"
-              f"过期 summary {dropped_expired} 个（保留 {OUTPUT_RETENTION_DAYS} 天）")
+    d_non, d_exp, d_stale = cleanup_outputs()
+    if d_non or d_exp or d_stale:
+        print(f"🧹 output 清理：非 summary {d_non} 个、过期 {d_exp} 个、"
+              f"旧版本残留 {d_stale} 个（保留 {OUTPUT_RETENTION_DAYS} 天）")
     print("-" * 60)
 
     all_results = []
@@ -1825,11 +1857,15 @@ def main():
         print(f"❌ 无法加载 ticker→CIK 映射表：{e}")
         tmap = {}
 
-    seen = load_seen()
-    pruned = seen.prune(STATE_RETENTION_DAYS)
-    if pruned:
-        print(f"🧹 state 清理：裁掉 {pruned} 条 {STATE_RETENTION_DAYS} 天前的去重记录"
-              f"（剩余 {len(seen)} 条）")
+    if FORCE_RESET:
+        seen = SeenStore()
+        print("🔁 已清空去重记录（FORCE_RESET）")
+    else:
+        seen = load_seen()
+        pruned = seen.prune(STATE_RETENTION_DAYS)
+        if pruned:
+            print(f"🧹 state 清理：裁掉 {pruned} 条 {STATE_RETENTION_DAYS} 天前的去重记录"
+                  f"（剩余 {len(seen)} 条）")
     save_seen(seen)
 
     for idx, ticker in enumerate(COMPANIES, 1):
