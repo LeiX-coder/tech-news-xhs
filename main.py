@@ -117,6 +117,11 @@ COMPANY_NEWS_URLS = {
     "STX": "https://investors.seagate.com/news-releases",
 }
 
+# 官网 RSS 覆盖表。留空则自动从列表页的 <link rel="alternate"> 发现。
+# 自动发现失败、或想强制指定时，在这里写死，例如：
+#   "NVDA": "https://nvidianews.nvidia.com/releases.xml",
+COMPANY_FEEDS = {}
+
 # 官网解析选择器（可针对不同公司定制）
 NEWS_SELECTORS = {
     "default": {
@@ -956,14 +961,94 @@ _NAV_TITLES = re.compile(
     r"view\s+all|archive|rss|home)$", re.I)
 
 
-def fetch_company_news(ticker: str, url: str, limit: int = MAX_WEB_CANDIDATES) -> list:
-    """只负责列出候选链接，正文由 fetch_article 单独抓。"""
-    try:
-        html = web_get(url, timeout=30).text
-        soup = BeautifulSoup(html, "lxml")
-    except Exception as e:
-        print(f"    ⚠️ 请求 {ticker} 官网失败: {e}")
+_FEED_TYPES = re.compile(r"application/(rss|atom)\+xml", re.I)
+
+
+def discover_feed_url(html: str, base_url: str):
+    """
+    从列表页的 <link rel="alternate" type="application/rss+xml"> 里找 RSS。
+    走 RSS 比爬 HTML 稳得多：自带发布时间、常常自带全文，
+    而且不用为每家公司猜 DOM 结构。
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for link in soup.find_all("link"):
+        rel = " ".join(link.get("rel") or []).lower()
+        typ = link.get("type") or ""
+        href = link.get("href")
+        if not href or not _FEED_TYPES.search(typ):
+            continue
+        if rel and "alternate" not in rel:
+            continue
+        return urljoin(base_url, href)
+    return None
+
+
+def _feed_entries(feed_url: str, limit: int) -> list:
+    """把 RSS/Atom 条目规整成和 HTML 抓取一致的结构。"""
+    feed = feedparser.parse(feed_url)
+    if getattr(feed, "bozo", 0) and not feed.entries:
         return []
+
+    out = []
+    for entry in feed.entries[:limit]:
+        title = re.sub(r"\s+", " ", entry.get("title", "")).strip()
+        link = entry.get("link", "")
+        if not title or not link:
+            continue
+        out.append({
+            "title": title,
+            "link": link,
+            "published": _rss_published_et(entry),
+            "body": _entry_body(entry),
+            "via": "RSS",
+        })
+    return out
+
+
+def collect_company_articles(ticker: str, listing_url: str,
+                             limit: int = MAX_WEB_CANDIDATES) -> list:
+    """
+    统一入口：先试 RSS，不行再退回爬列表页链接。
+    返回 [{title, link, published, body, via}]，body 可能为空（后续再回源抓）。
+    """
+    feed_url = COMPANY_FEEDS.get(ticker)
+    listing_html = None
+
+    if not feed_url:
+        try:
+            listing_html = web_get(listing_url, timeout=30).text
+            feed_url = discover_feed_url(listing_html, listing_url)
+        except Exception as e:
+            print(f"    ⚠️ 请求 {ticker} 官网失败: {e}")
+            return []
+
+    if feed_url:
+        try:
+            entries = _feed_entries(feed_url, limit)
+            if entries:
+                print(f"    📶 走 RSS: {feed_url}（{len(entries)} 条）")
+                return entries
+            print("    ℹ️ RSS 无有效条目，回退 HTML 抓取")
+        except Exception as e:
+            print(f"    ⚠️ RSS 解析失败，回退 HTML 抓取: {e}")
+
+    if listing_html is None:
+        try:
+            listing_html = web_get(listing_url, timeout=30).text
+        except Exception as e:
+            print(f"    ⚠️ 请求 {ticker} 官网失败: {e}")
+            return []
+
+    links = scrape_listing_links(ticker, listing_url, listing_html, limit)
+    if links:
+        print(f"    🕸️ 走 HTML 抓取（{len(links)} 条候选）")
+    return links
+
+
+def scrape_listing_links(ticker: str, url: str, html: str,
+                         limit: int = MAX_WEB_CANDIDATES) -> list:
+    """只负责列出候选链接，正文由 fetch_article 单独抓。"""
+    soup = BeautifulSoup(html, "lxml")
 
     cfg = NEWS_SELECTORS.get(ticker, NEWS_SELECTORS["default"])
     link_selector = cfg.get("link_selector", "a[href*='news'], a[href*='release']")
@@ -998,7 +1083,8 @@ def fetch_company_news(ticker: str, url: str, limit: int = MAX_WEB_CANDIDATES) -
         if not href.startswith("http"):
             continue
 
-        candidates.append({"title": title, "link": href})
+        candidates.append({"title": title, "link": href,
+                           "published": None, "body": "", "via": "HTML"})
 
     seen_links = set()
     unique = []
@@ -1131,6 +1217,38 @@ _DATE_LIKE = re.compile(
 )
 
 
+_SCALE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*[-\s]?(billion|million|trillion)", re.I)
+
+
+def _fmt_num(x: float) -> str:
+    return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+def _derived_numbers(source_text: str) -> set:
+    """
+    英文数量级 → 中文数量级的换算白名单。
+    原文写 "$500-billion"，文案写「5000亿美元」是对的，
+    但纯子串比对会误报。这里预先把等价写法算出来。
+    """
+    out = set()
+    for m in _SCALE.finditer(source_text):
+        try:
+            v = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        unit = m.group(2).lower()
+        if unit == "billion":
+            out.add(_fmt_num(v * 10))        # N billion = N*10 亿
+            out.add(_fmt_num(v / 100))       # = N/100 万亿
+        elif unit == "million":
+            out.add(_fmt_num(v * 100))       # N million = N*100 万
+            out.add(_fmt_num(v / 100))       # = N/100 亿
+        elif unit == "trillion":
+            out.add(_fmt_num(v * 10000))     # N trillion = N*10000 亿
+            out.add(_fmt_num(v))             # = N 万亿
+    return out
+
+
 def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> list:
     def normalize(s):
         s = s.replace(",", "").replace(" ", "")
@@ -1139,6 +1257,7 @@ def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> 
         return s
 
     src = normalize(source_text + " " + extra_allowed)
+    derived = _derived_numbers(source_text + " " + extra_allowed)
     cleaned = _DATE_LIKE.sub(" ", copy_text)
 
     suspicious = []
@@ -1149,8 +1268,9 @@ def check_numbers(copy_text: str, source_text: str, extra_allowed: str = "") -> 
             continue
         if re.fullmatch(r"(19|20)\d{2}", val):
             continue
-        if val not in src:
-            suspicious.append(raw)
+        if val in src or val in derived:
+            continue
+        suspicious.append(raw)
     return sorted(set(suspicious))
 
 
@@ -1162,6 +1282,28 @@ def check_dates(copy_text: str, date_known: bool) -> list:
     if hits:
         return [f"发布时间未知但文案出现日期表述: {', '.join(sorted(set(hits))[:5])}"]
     return []
+
+
+# 新闻稿 / SEC 申报里不可能出现的东西。出现即为模型自己补的。
+# 「NVDA 盘后交易小幅波动」就是被这一条抓住的典型。
+SUSPECT_PATTERNS = [
+    (r"盘后|盘前|股价|市值|涨幅|跌幅|收涨|收跌|市场反应|投资者反应",
+     "提及股价/盘后交易/市场反应 —— 官方新闻稿与申报文件不含这类信息"),
+    (r"分析师(认为|预计|指出|表示)|机构(认为|预计)|华尔街(认为|预计)",
+     "引用了分析师/机构观点 —— 材料里不会有"),
+    (r"业内人士|知情人士|有消息称|据传|外界猜测",
+     "出现无出处的传闻式表述"),
+]
+
+
+def check_grounding(copy_text: str) -> list:
+    """生成后的兜底检查：抓那些结构上不可能来自材料的内容。"""
+    out = []
+    for pat, desc in SUSPECT_PATTERNS:
+        m = re.search(pat, copy_text)
+        if m:
+            out.append(f"疑似编造（{desc}）：「{m.group()}」")
+    return out
 
 # ==================== SEC 处理流程 ====================
 
@@ -1388,12 +1530,11 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
     新版：先 fetch_article 抓正文和发布日期，抓不到就不生成文案。
     """
     results = []
-    articles = fetch_company_news(ticker, url, limit=MAX_WEB_CANDIDATES)
+    articles = collect_company_articles(ticker, url, limit=MAX_WEB_CANDIDATES)
     if not articles:
         return results
 
     cutoff = datetime.now(ET) - timedelta(days=DAYS_LOOKBACK)
-    print(f"    官网列出 {len(articles)} 条候选链接")
 
     for article in articles:
         aid = _stable_id("WEB", article["link"])
@@ -1401,24 +1542,39 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             print(f"    ⏭️  已处理: {article['title'][:40]}")
             continue
 
-        # 先抓正文，再决定要不要花 API 调用
-        try:
-            art = fetch_article(article["link"])
-        except Exception as e:
-            print(f"    ⚠️ 正文抓取失败（{article['title'][:35]}）: {e}")
-            continue
+        published = article.get("published")
+        body = article.get("body") or ""
+        title = article["title"]
+        source_url = article["link"]
+        truncated = False
 
-        published = art["published"]
-        date_known = published is not None
-
-        # 日期过滤：官网列表页经常混着几年前的旧闻
-        if date_known and published < cutoff:
-            print(f"    ⏭️  超出回溯窗口（{published.strftime('%Y-%m-%d')}）: {article['title'][:40]}")
+        # RSS 已给足日期就先做窗口过滤，省掉一次回源请求
+        if published and published < cutoff:
+            print(f"    ⏭️  超出回溯窗口（{published.strftime('%Y-%m-%d')}）: {title[:40]}")
             seen.add(aid)
             continue
 
-        body = art["text"]
-        title = art["title"] or article["title"]
+        # RSS 正文不够、或没给日期 → 回源抓原文
+        if len(body) < MIN_ARTICLE_CHARS or published is None:
+            try:
+                art = fetch_article(article["link"])
+                if len(art["text"]) > len(body):
+                    body = art["text"]
+                    truncated = art["truncated"]
+                published = published or art["published"]
+                title = art["title"] or title
+                source_url = art["url"]
+            except Exception as e:
+                print(f"    ⚠️ 正文抓取失败（{title[:35]}）: {e}")
+                if len(body) < MIN_ARTICLE_CHARS:
+                    continue
+
+        date_known = published is not None
+
+        if date_known and published < cutoff:
+            print(f"    ⏭️  超出回溯窗口（{published.strftime('%Y-%m-%d')}）: {title[:40]}")
+            seen.add(aid)
+            continue
 
         if len(body) < MIN_ARTICLE_CHARS:
             print(f"    📎 线索（正文仅 {len(body)} 字符）: {title[:40]}")
@@ -1428,7 +1584,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
                 form="官网",
                 dt=published,
                 rid=aid,
-                url=art["url"],
+                url=source_url,
                 items=["官网新闻"],
                 source="官网",
                 note="可能是列表页、登录墙或 JS 渲染页面。",
@@ -1437,10 +1593,10 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             continue
 
         content = (f"标题：{title}\n"
-                   f"来源页面：{art['url']}\n"
+                   f"来源页面：{source_url}\n"
                    + (f"原文发布时间：{published.strftime('%Y-%m-%d')} ET\n" if date_known else "")
                    + f"\n正文：\n{body}"
-                   + ("\n\n（注：正文超长，已截断）" if art["truncated"] else ""))
+                   + ("\n\n（注：正文超长，已截断）" if truncated else ""))
 
         copy_text = generate_copy(
             content=content,
@@ -1449,7 +1605,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             accepted_et=published,
             items=["官网新闻"],
             form="官网",
-            source_url=art["url"],
+            source_url=source_url,
             custom_title=title[:100],
             is_routine=False,
             date_known=date_known,
@@ -1470,6 +1626,10 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
                 warnings.append(f"数字未在原文中找到: {', '.join(bad)}")
                 print(f"    ⚠️  数字校验告警: {', '.join(bad)}")
             warnings.extend(check_dates(copy_text, date_known))
+            grounding = check_grounding(copy_text)
+            warnings.extend(grounding)
+            for g in grounding:
+                print(f"    🚩 {g}")
 
         results.append({
             "ticker": ticker,
@@ -1478,7 +1638,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             "accepted_et": published or datetime.now(ET),
             "accession": aid,
             "items": ["官网新闻"],
-            "url": art["url"],
+            "url": source_url,
             "exhibits": [],
             "copy": copy_text,
             "warnings": warnings,
@@ -1486,9 +1646,11 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             "source": "官网",
             "is_routine": False,
             "material_chars": len(body),
+            "via": article.get("via", "HTML"),
         })
         seen.add(aid)
-        print(f"    ✅ 官网新闻: {title[:40]}（正文 {len(body)} 字符）")
+        print(f"    ✅ 官网新闻: {title[:40]}"
+              f"（{article.get('via', 'HTML')}，正文 {len(body)} 字符）")
 
     return results
 
