@@ -258,6 +258,14 @@ STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
 SEEN_FILE = STATE_DIR / "seen_accessions.json"
 
+# 运行统计。零产出时用来解释「到底是没新内容，还是抓取失败了」。
+STATS = {
+    "skipped_seen": 0,        # 已处理过，被去重挡掉
+    "skipped_items": 0,       # SEC 条目不在白名单
+    "skipped_window": 0,      # 超出回溯窗口
+    "fetch_failed": 0,        # 抓取失败
+}
+
 # ==================== HTTP 层 ====================
 
 _lock = threading.Lock()
@@ -1329,6 +1337,7 @@ def process_company_sec(ticker: str, cik: int, seen: set):
     for f in filings:
         acc = f["accession"]
         if acc in seen:
+            STATS["skipped_seen"] += 1
             print(f"  ⏭️  已处理过: {acc}")
             continue
 
@@ -1336,6 +1345,7 @@ def process_company_sec(ticker: str, cik: int, seen: set):
         is_routine_6k = (decision == "6-K_ROUTINE")
 
         if decision is False:
+            STATS["skipped_items"] += 1
             print(f"  ⏭️  跳过 {acc} - {reason}")
             seen.add(acc)
             continue
@@ -1343,6 +1353,7 @@ def process_company_sec(ticker: str, cik: int, seen: set):
         try:
             built = build_content(f)
         except Exception as e:
+            STATS["fetch_failed"] += 1
             print(f"  ❌ {acc} 内容提取失败: {e}")
             continue
 
@@ -1453,6 +1464,7 @@ def process_techcrunch(articles: list, seen: set) -> list:
     for article in articles:
         aid = article["id"]
         if aid in seen:
+            STATS["skipped_seen"] += 1
             print(f"    ⏭️  已处理过: {article['title'][:50]}")
             continue
 
@@ -1550,6 +1562,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
     for article in articles:
         aid = _stable_id("WEB", article["link"])
         if aid in seen:
+            STATS["skipped_seen"] += 1
             print(f"    ⏭️  已处理: {article['title'][:40]}")
             continue
 
@@ -1561,6 +1574,7 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
 
         # RSS 已给足日期就先做窗口过滤，省掉一次回源请求
         if published and published < cutoff:
+            STATS["skipped_window"] += 1
             print(f"    ⏭️  超出回溯窗口（{published.strftime('%Y-%m-%d')}）: {title[:40]}")
             seen.add(aid)
             continue
@@ -1578,11 +1592,13 @@ def process_company_website(ticker: str, url: str, seen: set) -> list:
             except Exception as e:
                 print(f"    ⚠️ 正文抓取失败（{title[:35]}）: {e}")
                 if len(body) < MIN_ARTICLE_CHARS:
+                    STATS["fetch_failed"] += 1
                     continue
 
         date_known = published is not None
 
         if date_known and published < cutoff:
+            STATS["skipped_window"] += 1
             print(f"    ⏭️  超出回溯窗口（{published.strftime('%Y-%m-%d')}）: {title[:40]}")
             seen.add(aid)
             continue
@@ -1786,6 +1802,22 @@ def write_outputs(all_results: list, checked: int):
         leads = [r for r in all_results if r.get("lead_only")]
 
         fh.write(f"监控公司：{checked} 家　可用文案：{len(drafts)} 条\n\n")
+
+        if not all_results:
+            fh.write("## 📭 本次没有新的可用内容\n\n")
+            fh.write("这不代表出错。逐项看下面的跳过统计：\n\n")
+            fh.write(f"- 已处理过（被去重挡掉）：**{STATS['skipped_seen']}** 条\n")
+            fh.write(f"- SEC 条目不在白名单：{STATS['skipped_items']} 条\n")
+            fh.write(f"- 超出 {DAYS_LOOKBACK} 天回溯窗口：{STATS['skipped_window']} 条\n")
+            fh.write(f"- 抓取失败：{STATS['fetch_failed']} 条\n\n")
+            if STATS["skipped_seen"] > 0:
+                fh.write("> 「已处理过」占多数说明窗口内的内容在之前的运行里"
+                         "都生成过了，属正常。想重新生成一遍，用 `FORCE_RESET=1` 运行。\n\n")
+            if STATS["fetch_failed"] > 0:
+                fh.write("> 「抓取失败」不为零，说明有站点返回了错误或被拦截，"
+                         "去运行日志里搜 `⚠️` 看具体是哪几家。\n\n")
+            return summary
+
         fh.write(f"- SEC 申报：{len([r for r in drafts if r['source'] == 'SEC'])} 条\n")
         fh.write(f"- TechCrunch：{len([r for r in drafts if r['source'] == 'TechCrunch'])} 条\n")
         fh.write(f"- 公司官网：{len([r for r in drafts if r['source'] == '官网'])} 条\n")
@@ -1929,8 +1961,17 @@ def main():
 
     # ---- 4. 输出 ----
     print("-" * 60)
+    print(f"📊 跳过统计：已处理过 {STATS['skipped_seen']}　"
+          f"非白名单条目 {STATS['skipped_items']}　"
+          f"超出窗口 {STATS['skipped_window']}　"
+          f"抓取失败 {STATS['fetch_failed']}")
+
+    # 无论有没有内容都写 summary：output/ 永远不为空，
+    # artifact 上传不会再报 "No files were found"，
+    # 而且零产出时能从 summary 里看出原因。
+    path = write_outputs(all_results, len(COMPANIES))
+
     if all_results:
-        path = write_outputs(all_results, len(COMPANIES))
         drafts = [r for r in all_results if not r.get("lead_only")]
         sec_count = len([r for r in drafts if r['source'] == 'SEC'])
         tc_count = len([r for r in drafts if r['source'] == 'TechCrunch'])
@@ -1953,9 +1994,17 @@ def main():
                 print(f"     {r['ticker']}: {'；'.join(r['warnings'])}")
         if failed_sec:
             print(f"❌ SEC 失败：{', '.join(failed_sec)}")
-        print(f"📁 汇总：{path.absolute()}")
     else:
         print("📭 本次没有新的可用内容")
+        if STATS["skipped_seen"] > 0:
+            print(f"   窗口内 {STATS['skipped_seen']} 条都已在之前的运行处理过。")
+            print("   想重新生成一遍，用 FORCE_RESET=1 运行。")
+        if STATS["fetch_failed"] > 0:
+            print(f"   ⚠️ 另有 {STATS['fetch_failed']} 条抓取失败，往上翻日志看具体站点。")
+        if failed_sec:
+            print(f"❌ SEC 失败：{', '.join(failed_sec)}")
+
+    print(f"📁 汇总：{path.absolute()}")
 
 
 if __name__ == "__main__":
